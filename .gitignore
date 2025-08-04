@@ -1,0 +1,117 @@
+# dependencies (bun install)
+node_modules
+
+# output
+out
+dist
+*.tgz
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs
+_.log
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+
+# pi-lens AI coding agent
+.pi-lens/
+.pi/
+# Finder (MacOS) folder config
+.DS_Store
+config/modelmux.yaml
+config/*.db
+config/*.sqlite
+
+# Local dev populate overrides (may contain real API keys)
+scripts/user-populate.json
+.dev-data/
+.staging-backups/
+config/*.db*
+
+CLIProxyApi/
+llms/
+CAP-UI/
+CLIProxyApi/
+gemini-client-error*
+
+.gemini/
+gha-creds-*.json
+modelmux-linux
+modelmux-macos
+modelmux.exe
+sampledata/*.db
+auth.json
+packages/backend/config/
+research_and_plans/
+packages/logs.txt
+.vscode/mcp.json
+.pi/readcache/
+packages/backend/.test-db.sqlite
+packages/backend/.test-db.sqlite-shm
+packages/backend/.test-db.sqlite-wal
+.test-db.sqlite
+.test-db.sqlite-shm
+.test-db.sqlite-wal
+.pi-lens
+docs/openapi.yaml
+.githooks
+
+
+
+# Compiled binaries
+modelmux-
+modelmux
+# Sourcemap sidecars from `bun build --compile --sourcemap` (see compile:* scripts)
+/*.js.map
+!packages/backend/src/routes/mcp/modelmux/
+!packages/backend/src/routes/mcp/modelmux/**
+
+# Profiling output
+.prof/
+.grepai/
+mise.local.toml
+
+# Local raw Claude Code HTTP traces (contain auth tokens — never commit)
+claude1.txt
+claude2.txt
+claude3.txt
+
+.pi-subagents/
+.cora/
+
+# AI agent configuration (never commit)
+.agents/
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+**/AGENTS.md
+.opencode/
+.opencodereview/
+.openchamber/
+.cora.yaml
+.cora/
+skills-lock.json
+.github/prompts/
+paseo.json
+.config/wt.toml
+.repomap.txt
+SKILL.md
+**/SKILL.md
