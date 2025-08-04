@@ -1,0 +1,52 @@
+{
+  "name": "modelmux-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run --cwd ../.. generate:openapi:asset && bun run src/index.ts",
+    "dev": "bun run --cwd ../.. generate:openapi:asset && bun run --watch src/index.ts",
+    "typecheck": "bun check",
+    "rekey": "bun run src/cli/rekey.ts",
+    "backup": "bun run src/cli/backup.ts",
+    "generate-migrations": "cd ../.. && bun run scripts/generate-migrations.ts",
+    "lint:migrations": "cd ../.. && bun run scripts/lint-migrations.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
+    "@fastify/bearer-auth": "^10.1.1",
+    "@fastify/cors": "^11.1.0",
+    "@fastify/formbody": "^8.0.2",
+    "@fastify/multipart": "^9.0.3",
+    "@fastify/static": "^8.2.0",
+    "@google/genai": "^1.12.0",
+    "@modelcontextprotocol/sdk": "^1.17.1",
+    "@modelmux/shared": "workspace:*",
+    "@sinclair/typebox": "^0.34.38",
+    "@smithy/core": "^3.7.2",
+    "csv-parse": "^6.1.0",
+    "dotenv": "^17.2.1",
+    "drizzle-orm": "^0.44.4",
+    "drizzle-zod": "^0.8.2",
+    "eventsource-encoder": "^1.0.1",
+    "eventsource-parser": "^3.0.3",
+    "fastify": "^5.4.0",
+    "headroom-ai": "^0.41.0",
+    "js-tiktoken": "^1.0.20",
+    "parse-duration": "^2.1.4",
+    "pkce-challenge": "^5.0.0",
+    "postgres": "^3.4.7",
+    "vanilla-jsoneditor": "3.8.0",
+    "winston": "^3.17.0",
+    "winston-transport": "^4.9.0",
+    "yaml": "^2.8.0",
+    "zod": "^4.0.14"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.3.7",
+    "@types/bun": "latest",
+    "@types/node": "^24.2.0",
+    "@types/winston": "^2.4.4",
+    "drizzle-kit": "^0.31.4",
+    "form-data": "^4.0.4"
+  }
+}

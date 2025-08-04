@@ -1,0 +1,5 @@
+# Tests run with Bun's native test runner: `bun test` (repo root or here).
+# The preload registers shared mocks and creates the per-process test DB.
+
+[test]
+preload = ["./test/bun-test.setup.ts"]
