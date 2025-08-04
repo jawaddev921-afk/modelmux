@@ -1,0 +1,40 @@
+# Tests run with Bun's native test runner: `bun test` from the repo root.
+# The preload registers shared mocks and creates the per-process test DB.
+[test]
+preload = ["./packages/backend/test/bun-test.setup.ts"]
+
+# Formatter configuration for `bun fmt` (Bun 1.4.4+, replacing Biome).
+# `bun fmt` already skips .gitignore matches, node_modules, minified files and
+# lockfiles; ignorePatterns adds the generated and vendored paths below.
+[fmt]
+printWidth = 100
+tabWidth = 2
+useTabs = false
+semi = true
+singleQuote = true
+quoteProps = "as-needed"
+trailingComma = "es5"
+arrowParens = "always"
+bracketSpacing = true
+bracketSameLine = false
+endOfLine = "lf"
+proseWrap = "preserve"
+sortImports = true
+sortTailwindcss = true
+sortPackageJson = true
+# jsdoc stays off: it reflows and mangles ASCII diagrams inside doc comments.
+jsdoc = false
+ignorePatterns = [
+  # Build output
+  "**/dist/",
+  "**/build/",
+  "**/coverage/",
+  # Generated assets and checked-in generated code
+  "packages/frontend/src/assets/",
+  "packages/backend/src/assets/openapi.json",
+  # Generated migrations (never edit or reformat by hand)
+  "packages/backend/drizzle/migrations/",
+  "packages/backend/drizzle/migrations_pg/",
+  # Golden fixtures are compared byte-for-byte
+  "packages/backend/src/transformers/oauth/__tests__/golden-fixtures/",
+]
