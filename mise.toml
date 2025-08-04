@@ -1,0 +1,7 @@
+[tools]
+bun = "1.4.4"
+"github:fatedier/frp" = "latest"
+lefthook = "latest"
+
+[env]
+_.path = ["./node_modules/.bin"]
