@@ -1,0 +1,27 @@
+import { bigint, index, integer, pgTable, real, serial, text } from 'drizzle-orm/pg-core';
+
+export const providerPerformance = pgTable(
+  'provider_performance',
+  {
+    id: serial('id').primaryKey(),
+    provider: text('provider').notNull(),
+    model: text('model').notNull(),
+    canonicalModelName: text('canonical_model_name'),
+    requestId: text('request_id'),
+    timeToFirstTokenMs: real('time_to_first_token_ms'),
+    totalTokens: integer('total_tokens'),
+    durationMs: real('duration_ms'),
+    tokensPerSec: real('tokens_per_sec'),
+    e2eTokensPerSec: real('e2e_tokens_per_sec'),
+    failureCount: integer('failure_count').notNull().default(0),
+    successCount: integer('success_count').notNull().default(0),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+  },
+  (table) => ({
+    lookupIdx: index('idx_provider_performance_lookup').on(
+      table.provider,
+      table.model,
+      table.createdAt
+    ),
+  })
+);
