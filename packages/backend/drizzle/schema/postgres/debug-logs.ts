@@ -1,0 +1,25 @@
+import { bigint, index, integer, pgTable, serial, text } from 'drizzle-orm/pg-core';
+
+export const debugLogs = pgTable(
+  'debug_logs',
+  {
+    id: serial('id').primaryKey(),
+    requestId: text('request_id').notNull(),
+    apiKey: text('api_key'),
+    rawRequest: text('raw_request'),
+    transformedRequest: text('transformed_request'),
+    rawResponse: text('raw_response'),
+    transformedResponse: text('transformed_response'),
+    rawResponseSnapshot: text('raw_response_snapshot'),
+    transformedResponseSnapshot: text('transformed_response_snapshot'),
+    requestHeaders: text('request_headers'),
+    responseHeaders: text('response_headers'),
+    responseStatus: integer('response_status'),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+  },
+  (table) => ({
+    requestIdIdx: index('idx_debug_logs_request_id').on(table.requestId),
+    createdAtIdx: index('idx_debug_logs_created_at').on(table.createdAt),
+    apiKeyIdx: index('idx_debug_logs_api_key').on(table.apiKey),
+  })
+);
