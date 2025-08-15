@@ -1,0 +1,80 @@
+import { beforeEach, describe, expect, it, mock } from 'bun:test';
+
+import { UsageStorageService } from '../../../observability/usage-storage';
+import { QuotaScheduler } from '../../../quota/quota-scheduler';
+import { CostSelector } from '../cost';
+import { E2EPerformanceSelector } from '../e2e-performance';
+import { SelectorFactory } from '../factory';
+import { InOrderSelector } from '../in-order';
+import { LatencySelector } from '../latency';
+import { PerformanceSelector } from '../performance';
+import { QuotaSelector } from '../quota';
+import { RandomSelector } from '../random';
+import { UsageSelector } from '../usage';
+
+describe('SelectorFactory', () => {
+  const mockStorage = {} as unknown as UsageStorageService;
+  const mockQuotaScheduler = {
+    getLatestQuotaForProvider: mock(),
+  } as unknown as QuotaScheduler;
+
+  beforeEach(() => {
+    SelectorFactory.setUsageStorage(mockStorage);
+    SelectorFactory.setQuotaScheduler(mockQuotaScheduler);
+  });
+
+  it('should return RandomSelector for "random"', () => {
+    const selector = SelectorFactory.getSelector('random');
+    expect(selector).toBeInstanceOf(RandomSelector);
+  });
+
+  it('should return RandomSelector for undefined', () => {
+    const selector = SelectorFactory.getSelector(undefined);
+    expect(selector).toBeInstanceOf(RandomSelector);
+  });
+
+  it('should return RandomSelector for null', () => {
+    // @ts-ignore - explicitly testing null if somehow passed from loose types
+    const selector = SelectorFactory.getSelector(null);
+    expect(selector).toBeInstanceOf(RandomSelector);
+  });
+
+  it('should return CostSelector for "cost"', () => {
+    const selector = SelectorFactory.getSelector('cost');
+    expect(selector).toBeInstanceOf(CostSelector);
+  });
+
+  it('should return InOrderSelector for "in_order"', () => {
+    const selector = SelectorFactory.getSelector('in_order');
+    expect(selector).toBeInstanceOf(InOrderSelector);
+  });
+
+  it('should return PerformanceSelector for "performance"', () => {
+    const selector = SelectorFactory.getSelector('performance');
+    expect(selector).toBeInstanceOf(PerformanceSelector);
+  });
+
+  it('should return LatencySelector for "latency"', () => {
+    const selector = SelectorFactory.getSelector('latency');
+    expect(selector).toBeInstanceOf(LatencySelector);
+  });
+
+  it('should return E2EPerformanceSelector for "e2e_performance"', () => {
+    const selector = SelectorFactory.getSelector('e2e_performance');
+    expect(selector).toBeInstanceOf(E2EPerformanceSelector);
+  });
+
+  it('should throw for unknown selector', () => {
+    expect(() => SelectorFactory.getSelector('unknown')).toThrow('Unknown selector type: unknown');
+  });
+
+  it('should return UsageSelector for "usage"', () => {
+    const selector = SelectorFactory.getSelector('usage');
+    expect(selector).toBeInstanceOf(UsageSelector);
+  });
+
+  it('should return QuotaSelector for "quota"', () => {
+    const selector = SelectorFactory.getSelector('quota');
+    expect(selector).toBeInstanceOf(QuotaSelector);
+  });
+});
