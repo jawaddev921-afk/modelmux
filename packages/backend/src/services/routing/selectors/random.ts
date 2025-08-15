@@ -1,0 +1,12 @@
+import { ModelTarget } from '../../../config';
+import { Selector } from './base';
+
+export class RandomSelector extends Selector {
+  select(targets: ModelTarget[]): ModelTarget | null {
+    if (!targets || targets.length === 0) {
+      return null;
+    }
+    const index = Math.floor(Math.random() * targets.length);
+    return targets[index] || null;
+  }
+}
