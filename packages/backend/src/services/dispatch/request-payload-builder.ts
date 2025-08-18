@@ -1,0 +1,520 @@
+import { getConfig } from '../../config';
+import { clampAnthropicEffortAndThinking } from '../../transformers/anthropic/thinking-clamp';
+import { appendUserAfterTextOnlyModelTail } from '../../transformers/gemini/utils/model-tail';
+import type { ResolvedAdapter } from '../../types/provider-adapter';
+import type { UnifiedChatRequest } from '../../types/unified';
+import { getApiBaseType } from '../../utils/api-format';
+import { logger } from '../../utils/logger';
+import { applyModelBehaviors } from '../models/model-behaviors';
+import { OAuthAuthManager } from '../oauth/oauth-auth-manager';
+import { isClaudeMaskingApiKeyRoute, isOAuthRoute, isPiAiRoute } from '../oauth/oauth-dispatcher';
+import {
+  copilotEndpoint,
+  extractChatgptAccountId,
+  isCodexCliShapedBody,
+  isGenuineClaudeCodeRequest,
+  isNativeOAuthProvider,
+  type PreparedOAuthRequest,
+  prepareGenericOAuthDispatch,
+  prepareNativeOAuthDispatch,
+  resolveCopilotBaseUrl,
+} from '../oauth/oauth-native-request';
+import { applyGeminiThinkingConfig, getApiMetadata } from '../providers/provider-api-selection';
+import type { RouteResult } from '../routing/router';
+import { isAnthropicTargetProvider } from './adapter-resolver';
+import { applyBodyCacheKeyInjection } from './cache-key-injection';
+import {
+  applyNativeAnthropicCompat,
+  applyRegistryAutoCompat,
+  stripLiteUnsupportedTools,
+} from './dispatcher-auto-compat';
+import { applyEagerToolInputStreaming, sendsToAnthropicApi } from './eager-tool-streaming';
+import {
+  detectResponsesExtensions,
+  hasUnsupportedResponsesExtensions,
+} from './responses-extensions';
+import { applyServiceTierSelection } from './service-tier-selection';
+
+/** Symbol stash for the native OAuth prep, read by the standard dispatch seams. */
+export const NATIVE_OAUTH_STASH = Symbol('nativeOAuthPrep');
+
+/**
+ * Is this a Claude/Anthropic route served by the native (non-pi-ai) path?
+ * Covers BOTH Anthropic paths so NO Claude traffic touches the pi-ai executor:
+ *   - Anthropic OAuth (`oauth://`, provider anthropic)
+ *   - Claude-masking API-key route (`useClaudeMasking`, provider-name-agnostic)
+ */
+export function isNativeOAuthRoute(route: RouteResult, targetApiType: string): boolean {
+  if (isClaudeMaskingApiKeyRoute(route, targetApiType)) return true;
+  if (!isOAuthRoute(route, targetApiType)) return false;
+  const provider = route.config.oauth_provider || route.provider;
+  return isNativeOAuthProvider(provider);
+}
+
+export interface RequestPayload {
+  payload: any;
+  bypassTransformation: boolean;
+}
+
+/**
+ * Anthropic fast mode (`speed: 'fast'`) requires the `fast-mode-2026-02-01`
+ * beta flag. It is derived from the FINAL outbound body at fetch time — after
+ * provider/alias `extraBody` and adapter overrides, and again after any
+ * strip-and-retry — so a later override to `speed: 'standard'` never leaves a
+ * stale fast-mode beta on the request. Existing caller betas are preserved; the
+ * flag is only appended when absent.
+ */
+export function applyAutoAnthropicBetas(
+  headers: Record<string, string>,
+  payload: any,
+  targetApiType: string
+): void {
+  if (getApiBaseType(targetApiType) !== 'messages') return;
+  if ((payload as { speed?: unknown } | null)?.speed !== 'fast') return;
+  // Config/route headers may spell the header with any casing (e.g.
+  // `Anthropic-Beta`). Merge into the existing key so a fast-mode append does
+  // not leave a duplicate, case-differing header behind.
+  const existingKey = Object.keys(headers).find((key) => key.toLowerCase() === 'anthropic-beta');
+  const betas = (existingKey ? (headers[existingKey] ?? '') : '')
+    .split(',')
+    .map((beta) => beta.trim())
+    .filter(Boolean);
+  if (!betas.includes('fast-mode-2026-02-01')) betas.push('fast-mode-2026-02-01');
+  headers[existingKey ?? 'anthropic-beta'] = betas.join(',');
+}
+
+/**
+ * Drop Anthropic mid-conversation `role: 'system'` entries for egress formats
+ * that have no in-conversation system concept.
+ *
+ * Those entries are marked by the Messages parser so a rebuilt Messages request
+ * can re-emit the caller's own entry verbatim at its position. Other wire
+ * formats cannot express a system turn mid-conversation, and folding the
+ * content into the target's system prompt would rewrite the caller's prompt,
+ * so cross-format egress drops them deliberately — the same documented-drop
+ * convention used for other Anthropic-native fields the target cannot express.
+ * The per-turn effort they carry is not lost: it already travelled to the
+ * target on `request.reasoning` (see getMidConversationEffort).
+ */
+export function dropMidConversationEntries(request: UnifiedChatRequest): UnifiedChatRequest {
+  if (!request.messages?.some((message) => message.mid_conversation)) return request;
+  return {
+    ...request,
+    messages: request.messages.filter((message) => !message.mid_conversation),
+  };
+}
+
+function shouldUsePassThrough(
+  request: UnifiedChatRequest,
+  targetApiType: string,
+  route: RouteResult
+): boolean {
+  // Native OAuth (Anthropic) runs through the standard path and IS eligible for
+  // same-format pass-through — only the pi-ai executor routes (Codex/Copilot)
+  // need the IR and must skip pass-through.
+  const nativeOAuth = isNativeOAuthRoute(route, targetApiType);
+  if (
+    (request as any)._hasVisionFallthrough ||
+    (isPiAiRoute(route, targetApiType) && !nativeOAuth)
+  ) {
+    return false;
+  }
+
+  // Responses extensions the target doesn't accept verbatim must be flattened
+  // by the transformer (see responses-extensions.ts).
+  if (hasUnsupportedResponsesExtensions(request.originalBody, route, targetApiType)) {
+    return false;
+  }
+
+  return (
+    !!request.incomingApiType?.toLowerCase() &&
+    request.incomingApiType.toLowerCase() === targetApiType.toLowerCase() &&
+    !!request.originalBody
+  );
+}
+
+/** Builds the provider payload after transformation, configuration, and adapters. */
+export async function buildRequestPayload(
+  request: UnifiedChatRequest,
+  route: RouteResult,
+  transformer: any,
+  targetApiType: string,
+  adapters: ResolvedAdapter[] = []
+): Promise<RequestPayload> {
+  const nativeOAuth = isNativeOAuthRoute(route, targetApiType);
+  // Any other OAuth-style route (an `oauth://` provider that isn't one of the
+  // native ones, and never the Claude-masking API-key route — that always
+  // resolves to native Anthropic). Config validation already restricts
+  // `oauth_provider` to providers pi-ai actually supports, so this is any
+  // pi-ai OAuth provider ModelMux doesn't hand-port — see oauth-native-request.ts.
+  const genericOAuth =
+    !nativeOAuth &&
+    !isClaudeMaskingApiKeyRoute(route, targetApiType) &&
+    isPiAiRoute(route, targetApiType);
+
+  // Codex two-path decision. A genuine Codex CLI body is sent to the ChatGPT
+  // backend VERBATIM (pass-through) when the backend accepts every extension
+  // it carries. Any other request is forced through the transformer + adorned
+  // for the backend, even though incoming == target == responses — so Codex
+  // doesn't use the same-format `shouldUsePassThrough` rule.
+  const oauthProviderForNative = isClaudeMaskingApiKeyRoute(route, targetApiType)
+    ? 'anthropic'
+    : route.config.oauth_provider || route.provider;
+  const codexNative = nativeOAuth && oauthProviderForNative === 'openai-codex';
+  const copilotNative = nativeOAuth && oauthProviderForNative === 'github-copilot';
+  const museNative = nativeOAuth && oauthProviderForNative === 'meta';
+  const codexCliPassthrough =
+    codexNative &&
+    isCodexCliShapedBody(request.originalBody) &&
+    !hasUnsupportedResponsesExtensions(request.originalBody, route, targetApiType);
+  const anthropicNative = nativeOAuth && oauthProviderForNative === 'anthropic';
+  const incomingBaseType = getApiBaseType(request.incomingApiType?.toLowerCase() ?? '');
+  const incomingIsResponses = incomingBaseType === 'responses';
+
+  // Everything except Codex: standard same-format pass-through detection,
+  // which flattens any Responses extension the target doesn't accept (Meta
+  // accepts its own namespace tools — see getDefaultResponsesExtensions).
+  // For Copilot this is authoritative (multi-API: a client may send a format
+  // the target model's wire API doesn't match, requiring response
+  // translation); Anthropic clients are always same-format in practice.
+  const bypassTransformation = codexNative
+    ? codexCliPassthrough
+    : shouldUsePassThrough(request, targetApiType, route);
+  let payload: any;
+
+  if (bypassTransformation) {
+    logger.debug(
+      `Pass-through optimization active: ${request.incomingApiType} -> ${targetApiType}` +
+        (adapters.length > 0 ? ` (with ${adapters.length} adapter(s))` : '')
+    );
+    payload = JSON.parse(JSON.stringify(request.originalBody));
+    payload.model = route.model;
+
+    // Native Gemini pass-through forwards `contents` verbatim, so a client
+    // history ending on a text-only model turn would 400 upstream
+    // ("Requests ending with a model turn are not supported", LiteLLM
+    // #38537 / PR #38652). Normalize the tail the same way the transform
+    // path does. Tool-call / media tails are left untouched.
+    if (getApiBaseType(targetApiType) === 'gemini' && Array.isArray((payload as any)?.contents)) {
+      const before = (payload as any).contents.length;
+      (payload as any).contents = appendUserAfterTextOnlyModelTail((payload as any).contents);
+      if ((payload as any).contents.length !== before) {
+        logger.debug('Auto-compat: appended synthetic user turn after text-only model tail');
+      }
+    }
+
+    if (request.metadata) {
+      const apiMetadata = getApiMetadata(request.metadata);
+      if (Object.keys(apiMetadata).length > 0) payload.metadata = apiMetadata;
+    }
+  } else {
+    const oauthProvider = isClaudeMaskingApiKeyRoute(route, targetApiType)
+      ? 'anthropic'
+      : route.config.oauth_provider || route.provider;
+    const requestWithOAuthProvider = oauthProvider
+      ? {
+          ...request,
+          metadata: {
+            ...(request.metadata || {}),
+            modelmux_metadata: {
+              ...((request.metadata as any)?.modelmux_metadata || {}),
+              oauthProvider,
+            },
+          },
+        }
+      : request;
+    // Same-format Messages egress keeps the mid-conversation markers so the
+    // builder can re-emit the caller's entries in place; every other target
+    // deliberately drops them (see dropMidConversationEntries).
+    const requestForTransform =
+      getApiBaseType(targetApiType) === 'messages'
+        ? requestWithOAuthProvider
+        : dropMidConversationEntries(requestWithOAuthProvider);
+    payload = await transformer.transformRequest(requestForTransform);
+  }
+
+  // Claude genuine-client fast-path. Masking only exists on the native
+  // Anthropic OAuth/masking routes (`anthropicNative`), so the gate is scoped
+  // there — plain API-key providers never mask in the first place. The body
+  // actually sent must be the verbatim client body (`bypassTransformation`):
+  // the genuine-client fingerprint was checked on `originalBody`, so a
+  // transformer-rebuilt `payload` still goes through masking as usual.
+  // `isAnthropicTargetProvider` re-asserts the upstream is really Anthropic
+  // (hostname, Anthropic OAuth, or masking route). Fail-closed throughout.
+  const claudePassthrough =
+    anthropicNative &&
+    bypassTransformation &&
+    isAnthropicTargetProvider(route, targetApiType) &&
+    isGenuineClaudeCodeRequest(request);
+  if (claudePassthrough) {
+    logger.debug('Claude genuine-client passthrough active: masking skipped, key swap only');
+  }
+
+  // Defense in depth: non-Gemini-transformer paths (cross-format routing to
+  // a Gemini target, adapters that rewrite contents) can still produce a
+  // trailing text-only model turn. Normalize unconditionally for Gemini
+  // targets — the helper is a no-op unless the tail matches.
+  if (getApiBaseType(targetApiType) === 'gemini' && Array.isArray((payload as any)?.contents)) {
+    (payload as any).contents = appendUserAfterTextOnlyModelTail((payload as any).contents);
+  }
+
+  // Before auto-compat so registry-aware mapping sees the tier the client asked for.
+  payload = applyServiceTierSelection(payload, request, targetApiType);
+
+  payload = applyGeminiThinkingConfig(route, targetApiType, payload);
+  if (anthropicNative && !bypassTransformation) {
+    payload = applyNativeAnthropicCompat(payload, request, route.model);
+  }
+  payload = applyRegistryAutoCompat(payload, request, route, targetApiType);
+
+  payload = applyEagerToolInputStreaming(
+    payload,
+    request,
+    route,
+    targetApiType,
+    bypassTransformation
+  );
+
+  // Inject the provider's configured cache/session key before the extraBody
+  // merges so an explicit admin extraBody value still wins. Runs before the
+  // native OAuth preparation below so Meta's Responses body carries it.
+  payload = applyBodyCacheKeyInjection(payload, route, request, targetApiType);
+
+  if (route.config.extraBody) payload = { ...payload, ...route.config.extraBody };
+  if (route.modelConfig?.extraBody) payload = { ...payload, ...route.modelConfig.extraBody };
+
+  if (route.canonicalModel) {
+    const aliasConfig = getConfig().models?.[route.canonicalModel];
+    if (aliasConfig?.extraBody) payload = { ...payload, ...aliasConfig.extraBody };
+    // Invoked even when the alias has no `advanced` entries: some behaviors
+    // apply implicitly. `inject_cache_control` auto-enables for aliases that
+    // dispatch to Anthropic's own API, and an explicitly configured behavior
+    // (including `enabled: false`) always overrides that default.
+    payload = applyModelBehaviors(payload, aliasConfig?.advanced, {
+      incomingApiType: request.incomingApiType ?? '',
+      canonicalModel: route.canonicalModel,
+      targetApiType,
+      autoEnableCacheControl: sendsToAnthropicApi(route, targetApiType),
+      // The native Anthropic path rewrites `system` (Claude Code masking) after
+      // this point, so behaviors must not count on a system breakpoint there.
+      systemRewrittenByMasking: anthropicNative,
+    });
+  }
+
+  for (const { adapter, options } of adapters) {
+    payload = adapter.preDispatch(payload, options);
+  }
+
+  if (adapters.length > 0) {
+    logger.debug(
+      `Adapters applied (preDispatch): [${adapters.map((entry) => entry.adapter.name).join(', ')}] ` +
+        `for ${route.provider}/${route.model}`
+    );
+  }
+
+  if (
+    isAnthropicTargetProvider(route, targetApiType) ||
+    getApiBaseType(targetApiType) === 'messages'
+  ) {
+    const outboundModel = typeof payload?.model === 'string' ? payload.model : route.model;
+    payload = clampAnthropicEffortAndThinking(payload, outboundModel);
+  }
+
+  // The provider-side `X-OpenAI-Internal-Codex-Responses-Lite` header (set in
+  // setupHeaders/setupProviderHeaders whenever targetApiType is exactly
+  // `responses:lite`) comes with a wire contract both providers currently
+  // configured for the subtype (openlimits, openai-s) enforce with a 400:
+  // `reasoning.context` must be `all_turns`, `parallel_tool_calls` must be
+  // `false`, and declared tools are restricted to function/custom/tool_search
+  // (see LITE_ALLOWED_TOOL_TYPES) — real Codex CLI traffic declares
+  // `web_search` by default. Real Codex CLI requests don't reliably satisfy
+  // any of these (see staging trace b672ebbd), so normalize proactively here
+  // rather than paying a strip-and-retry round trip on every such request —
+  // dispatcher-auto-compat.ts's reactive strip-and-retry stays in place as a
+  // fallback for anything this proactive pass doesn't anticipate. This is
+  // NOT a property of `responses:lite` in general: it's specific to this
+  // generic `/v1/responses` + header contract used by non-native providers.
+  // The native Codex/ChatGPT backend (see oauth-native-request.ts's
+  // `prepareCodexOAuthRequest`) hits its own dedicated `/codex/responses`
+  // endpoint, never sends this header, and accepts the client's tools
+  // (including web_search) verbatim — so native OAuth routes are excluded.
+  if (!nativeOAuth && targetApiType.toLowerCase() === 'responses:lite') {
+    payload = {
+      ...payload,
+      // The lite header requires this even when the client omits reasoning
+      // entirely (trace 26d1e440). Enforce the contract over client/extraBody
+      // context values, while preserving effort, summary, and other options.
+      // Models that reject reasoning must use a base Responses target rather
+      // than this header-based lite contract.
+      reasoning: { ...payload.reasoning, context: 'all_turns' },
+      parallel_tool_calls: false,
+    };
+    const toolStripResult = stripLiteUnsupportedTools(payload);
+    if (toolStripResult.strippedCount > 0) {
+      logger.debug(
+        `Auto-compat: proactively stripped ${toolStripResult.strippedCount} tool(s) unsupported ` +
+          `by responses:lite for ${route.provider}/${route.model}`
+      );
+    }
+    payload = toolStripResult.payload;
+  }
+
+  // Native OAuth (currently Anthropic): the payload above is already the correct
+  // provider-native wire body (pass-through of the client's Messages body, or a
+  // cross-format transform to it). Layer the CC masking/fingerprint + OAuth
+  // token resolution on top, and stash the resolved URL/headers/reverse-frame
+  // for the standard dispatch seams. No pi-ai Context IR, no piAiModels.stream.
+  // This is the ONLY OAuth-specific step — one path, masking
+  // applied when the selected target is an OAuth target.
+  if (nativeOAuth) {
+    const maskingApiKeyRoute = isClaudeMaskingApiKeyRoute(route, targetApiType);
+    const provider = (
+      maskingApiKeyRoute ? 'anthropic' : route.config.oauth_provider || route.provider
+    ) as string;
+    const prepared: PreparedOAuthRequest = await prepareNativeOAuthDispatch({
+      provider: provider as any,
+      modelId: route.model,
+      nativeBody: payload,
+      streaming: !!request.stream,
+      oauthAccountId: route.config.oauth_account?.trim(),
+      maskingApiKey: maskingApiKeyRoute ? (route.config.api_key ?? '') : null,
+      codexPassthrough: codexCliPassthrough,
+      // `targetApiType` here is the resolved wire type (effectiveApiType) that
+      // request-manager passes for native OAuth routes — Copilot needs it to
+      // pick the right endpoint (chat/messages/responses).
+      apiType: targetApiType,
+      // The caller's own `anthropic-beta` flags. Merged with REQUIRED_BETAS
+      // rather than discarded, so beta-gated client features (e.g. the advisor
+      // tool) survive the gateway instead of being rejected upstream.
+      callerBetas: request.anthropicBeta,
+      claudePassthrough,
+      callerUserAgent: request.userAgent,
+      callerSessionId: request.claudeCodeSessionId,
+    });
+    (route as any)[NATIVE_OAUTH_STASH] = prepared;
+    logger.debug(
+      `Native OAuth payload prepared for ${provider}/${route.model} (url=${prepared.url})` +
+        (claudePassthrough ? ' [claude-passthrough]' : '')
+    );
+    // Codex CLI and Responses clients receive the native Responses stream.
+    // Cross-format Codex requests must translate the response back to the
+    // incoming client format. Anthropic bypasses only for same-format
+    // (Messages) clients — chat/responses clients get the response
+    // translated by the standard pipeline (mirrors the identical Codex fix,
+    // commit 4f74c1c6). Copilot and Muse honor their computed request-side
+    // pass-through decision.
+    const incomingIsMessages = incomingBaseType === 'messages';
+    // Muse mirrors the request decision rather than assuming a raw response:
+    // if the request went through the transformer (e.g. a `responses:lite`
+    // body Meta doesn't natively parse), the response must too, so the client
+    // transformer's namespaceMap can split flattened tool calls back.
+    // A transformed Codex request that carried extensions was flattened, so
+    // its response must be translated for the names to split back.
+    const nativeBypass = codexNative
+      ? codexCliPassthrough ||
+        (incomingIsResponses && detectResponsesExtensions(request.originalBody).size === 0)
+      : copilotNative || museNative
+        ? bypassTransformation
+        : incomingIsMessages;
+    return { payload: prepared.body, bypassTransformation: nativeBypass };
+  }
+
+  // Generic OAuth: `payload` above is already the correct standard-path wire
+  // body (shouldUsePassThrough forces bypassTransformation=false for these
+  // routes, so it always went through transformer.transformRequest()).
+  // `targetApiType` here is the resolved wire type (effectiveApiType) that
+  // request-manager passes for generic OAuth routes. Only auth + URL differ
+  // from an ordinary API-key provider on the same wire API.
+  if (genericOAuth) {
+    const provider = route.config.oauth_provider || route.provider;
+    const prepared = await prepareGenericOAuthDispatch({
+      provider,
+      modelId: route.model,
+      body: payload,
+      streaming: !!request.stream,
+      apiType: targetApiType,
+      oauthAccountId: route.config.oauth_account?.trim(),
+      extraHeaders: route.config.headers,
+    });
+    (route as any)[NATIVE_OAUTH_STASH] = prepared;
+    logger.debug(
+      `Generic OAuth payload prepared for ${provider}/${route.model} (url=${prepared.url})`
+    );
+    return { payload: prepared.body, bypassTransformation };
+  }
+
+  return { payload, bypassTransformation };
+}
+
+/**
+ * Reactively refreshes OAuth credentials and updates stashed wire request
+ * parameters (url + headers) after an upstream 401. Returns the updated url and
+ * headers for a retry attempt against the same target, or null if the route
+ * is not a refreshable OAuth route or has no active stash.
+ */
+export async function refreshOAuthRoute(
+  route: RouteResult,
+  targetApiType: string,
+  signal?: AbortSignal
+): Promise<{ url: string; headers: Record<string, string> } | null> {
+  const nativeOAuth = isNativeOAuthRoute(route, targetApiType);
+  const genericOAuth =
+    !nativeOAuth &&
+    !isClaudeMaskingApiKeyRoute(route, targetApiType) &&
+    isPiAiRoute(route, targetApiType);
+
+  if (!nativeOAuth && !genericOAuth) return null;
+  if (isClaudeMaskingApiKeyRoute(route, targetApiType)) return null;
+
+  const stashed = (route as any)[NATIVE_OAUTH_STASH] as PreparedOAuthRequest | undefined;
+  if (!stashed) return null;
+
+  const provider = (route.config.oauth_provider || route.provider) as string;
+  const oauthAccountId = route.config.oauth_account?.trim();
+
+  if (genericOAuth) {
+    const prepared = await prepareGenericOAuthDispatch({
+      provider,
+      modelId: route.model,
+      body: stashed.body,
+      streaming: stashed.headers.Accept?.includes('text/event-stream') ?? false,
+      apiType: targetApiType,
+      oauthAccountId,
+      extraHeaders: route.config.headers,
+      forceRefresh: true,
+      signal,
+    });
+    (route as any)[NATIVE_OAUTH_STASH] = prepared;
+    return { url: prepared.url, headers: prepared.headers };
+  }
+
+  // Native OAuth: force-refresh the token via OAuthAuthManager
+  const token = await OAuthAuthManager.getInstance().getApiKey(provider, oauthAccountId, {
+    forceRefresh: true,
+    signal,
+  });
+
+  // Update Authorization header with the fresh token
+  stashed.headers = {
+    ...stashed.headers,
+    Authorization: `Bearer ${token}`,
+  };
+
+  if (provider === 'openai-codex') {
+    const accountId = extractChatgptAccountId(token);
+    if (accountId) {
+      stashed.headers['chatgpt-account-id'] = accountId;
+    } else {
+      delete stashed.headers['chatgpt-account-id'];
+    }
+  } else if (provider === 'github-copilot') {
+    const resolvedBaseUrl = await OAuthAuthManager.getInstance().getBaseUrl(
+      provider,
+      oauthAccountId
+    );
+    const baseUrl = (resolvedBaseUrl || resolveCopilotBaseUrl(token)).replace(/\/$/, '');
+    stashed.url = `${baseUrl}${copilotEndpoint(targetApiType)}`;
+  }
+
+  return { url: stashed.url, headers: stashed.headers };
+}
