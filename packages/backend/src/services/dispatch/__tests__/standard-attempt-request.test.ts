@@ -1,0 +1,673 @@
+import { describe, expect, it, mock, test } from 'bun:test';
+
+import { registerSpy } from '../../../../test/test-utils';
+import type { UnifiedChatRequest } from '../../../types/unified';
+import type { StallConfig } from '../../inspectors/stall-inspector';
+import { OAuthAuthManager } from '../../oauth/oauth-auth-manager';
+import type { RouteResult } from '../../routing/router';
+import { isRetryableOAuthError, isRetryableStatus } from '../failover-policy';
+import type { RequestManagerHost } from '../request-manager';
+import { NATIVE_OAUTH_STASH } from '../request-payload-builder';
+import {
+  deriveProbeStallConfig,
+  executeStandardAttempt,
+  type StandardAttemptContext,
+} from '../standard-attempt-request';
+
+function makeStallConfig(overrides: Partial<StallConfig> = {}): StallConfig {
+  return {
+    ttfbMs: 5000,
+    ttfbBytes: 1024,
+    minBytesPerSecond: null,
+    windowMs: 1000,
+    gracePeriodMs: 0,
+    ...overrides,
+  };
+}
+
+describe('deriveProbeStallConfig', () => {
+  it('returns the pristine config unchanged when no fetch time has elapsed', () => {
+    const pristine = makeStallConfig({ ttfbMs: 5000 });
+    expect(deriveProbeStallConfig(pristine, 0)).toEqual(pristine);
+  });
+
+  it('nulls out ttfbMs once elapsed time meets or exceeds the full budget', () => {
+    const pristine = makeStallConfig({ ttfbMs: 5000 });
+    expect(deriveProbeStallConfig(pristine, 5000)).toEqual({ ...pristine, ttfbMs: null });
+    expect(deriveProbeStallConfig(pristine, 6000)).toEqual({ ...pristine, ttfbMs: null });
+  });
+
+  it('reduces ttfbMs by the elapsed time for a partial budget', () => {
+    const pristine = makeStallConfig({ ttfbMs: 5000 });
+    expect(deriveProbeStallConfig(pristine, 4900)).toEqual({ ...pristine, ttfbMs: 100 });
+  });
+
+  it('passes a null/undefined pristine config through unchanged', () => {
+    expect(deriveProbeStallConfig(null, 1000)).toBeNull();
+    expect(deriveProbeStallConfig(undefined, 1000)).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dispatch-level seam: `host.probeStreamingStart` is the injected "probe
+// config receiver" — executeStandardAttempt calls it exactly once, after the
+// same-target strip-and-retry while(true) loop breaks, with whatever
+// `effectiveStallConfig` the FINAL iteration computed. That makes it the
+// only clean spy-able point to prove which ttfbMs budget a given iteration
+// actually derived from (there is no host method that observes the *armed*
+// per-iteration TTFB timer directly — it's a local `setTimeout`, not passed
+// through the host).
+// ---------------------------------------------------------------------------
+
+function makeRoute(): RouteResult {
+  return { provider: 'p1', model: 'model-1', config: {} as any } as RouteResult;
+}
+
+function makeStreamingRequest(): UnifiedChatRequest {
+  return {
+    requestId: 'req-1',
+    model: 'model-1',
+    messages: [{ role: 'user', content: 'hi' } as any],
+    stream: true,
+    incomingApiType: 'chat',
+  };
+}
+
+function makeHost(overrides: Partial<RequestManagerHost> = {}): RequestManagerHost {
+  return {
+    appendFailureAttempt: mock(),
+    appendSkippedAttempt: mock(),
+    appendSuccessAttempt: mock(),
+    attachAttemptMetadata: mock(),
+    buildAllTargetsFailedError: mock(() => new Error('all targets failed')),
+    buildCancelledError: mock(() => new Error('cancelled')),
+    buildRequestUrl: mock(() => 'https://example.test/v1/chat/completions'),
+    buildTimeoutError: mock(() => new Error('timeout')),
+    createAttemptTimeout: mock(),
+    dispatchImageGenerations: mock(async () => ({}) as any),
+    emitRoutingUpdate: mock(),
+    executeProviderRequest: mock(),
+    formatFailureReason: mock((error: any) => error?.message ?? 'error'),
+    getUsageStorage: mock(() => undefined),
+    handleNonStreamingResponse: mock(async () => ({}) as any),
+    handleProviderError: mock(),
+    handleStreamingResponse: mock(() => ({}) as any),
+    isPiAiRoute: mock(() => false),
+    isRetryableNetworkError: mock(() => false),
+    isRetryableStatus: mock(() => false),
+    probeStreamingStart: mock(),
+    recordAttemptMetric: mock(async () => {}),
+    recordStickySession: mock(),
+    saveIntermediateError: mock(),
+    selectTargetApiType: mock(() => ({ selectionReason: 'test' })),
+    setupHeaders: mock(() => ({})),
+    transformRequestPayload: mock(async () => ({ payload: {}, bypassTransformation: false })),
+    ...overrides,
+  };
+}
+
+describe('executeStandardAttempt — per-fetch TTFB budget reset', () => {
+  it("gives a same-target strip-and-retry attempt the full pristine TTFB budget instead of the previous attempt's reduced one", async () => {
+    const dateSpy = registerSpy(Date, 'now');
+    // Sequence matches the exact Date.now() read sites for this scenario:
+    // iter1 dispatchStartTime, iter1 post-fetch (fetchElapsed calc), iter2
+    // dispatchStartTime, iter2 post-fetch (fetchElapsed calc). The strip
+    // path taken between iter1 and iter2 doesn't call Date.now() itself, and
+    // the synthetic probeStreamingStart failure below short-circuits the
+    // function before any later (CooldownManager-driven) Date.now() calls.
+    dateSpy
+      .mockReturnValueOnce(1_000_000) // iter1 dispatchStartTime
+      .mockReturnValueOnce(1_004_900) // iter1 post-fetch => fetchElapsed 4900ms (near the 5000ms budget)
+      .mockReturnValueOnce(2_000_000) // iter2 dispatchStartTime
+      .mockReturnValueOnce(2_000_050); // iter2 post-fetch => fetchElapsed 50ms
+
+    const badRequestResponse = new Response(
+      JSON.stringify({ error: { message: "Unsupported parameter: 'safety_identifier'" } }),
+      { status: 400 }
+    );
+    const okResponse = new Response(null, { status: 200 });
+
+    const executeProviderRequest = mock()
+      .mockResolvedValueOnce(badRequestResponse)
+      .mockResolvedValueOnce(okResponse);
+
+    const probeStopError = new Error('test-stop-after-probe');
+    const probeStreamingStart = mock().mockResolvedValue({
+      ok: false,
+      streamStarted: true,
+      error: probeStopError,
+    });
+
+    const host = makeHost({ executeProviderRequest, probeStreamingStart });
+    const route = makeRoute();
+    const request = makeStreamingRequest();
+
+    // originalBody-less payload carrying the exact field the synthetic 400
+    // names, so planUnsupportedParamStrip's paired deleteDottedPath actually
+    // removes something (`deleted: true`) — otherwise the strip is refused
+    // and the loop falls through to normal failover instead of retrying the
+    // same target, which is the scenario this test needs.
+    const providerPayload = { model: 'model-1', safety_identifier: 'abc' };
+
+    const context: StandardAttemptContext = {
+      host,
+      providerPayload,
+      request,
+      requestWithTargetModel: request,
+      route,
+      targetApiType: 'chat',
+      transformer: { name: 'test-transformer' },
+      bypassTransformation: false,
+      adapters: [],
+      stallConfig: makeStallConfig({ ttfbMs: 5000 }),
+      attemptTimeout: {
+        signal: new AbortController().signal,
+        isTimedOut: () => false,
+        cleanup: mock(),
+      },
+      failoverEnabled: true,
+      hasNextTarget: true,
+      retryableStatusCodes: [500, 502, 503],
+      retryableErrors: [],
+      retryHistory: [],
+      attemptedProviders: [],
+      sessionKey: null,
+      release: mock(),
+    };
+
+    await expect(executeStandardAttempt(context)).rejects.toThrow('test-stop-after-probe');
+
+    // Same target dispatched twice: the initial attempt, then the
+    // strip-and-retry after the 400.
+    expect(executeProviderRequest).toHaveBeenCalledTimes(2);
+    expect(probeStreamingStart).toHaveBeenCalledTimes(1);
+
+    const [, receivedStallConfig] = probeStreamingStart.mock.calls[0]!;
+    // Pristine ttfbMs is 5000ms. Iteration 2's own fetch took 50ms (per the
+    // Date.now() sequence above), so a correctly-reset budget leaves
+    // 4950ms for the probe. Before the fix, iteration 2 inherited
+    // iteration 1's already-reduced ttfbMs (100ms, left over from a
+    // 4900ms first fetch against the same 5000ms budget) and derived only
+    // 50ms from THAT — starving the probe of nearly its whole budget.
+    expect(receivedStallConfig.ttfbMs).toBe(4950);
+  });
+});
+
+describe('executeStandardAttempt — auto fast-mode beta', () => {
+  function makeFastModeContext(
+    host: RequestManagerHost,
+    providerPayload: any
+  ): StandardAttemptContext {
+    const request: UnifiedChatRequest = {
+      requestId: 'req-1',
+      model: 'model-1',
+      messages: [{ role: 'user', content: 'hi' } as any],
+      stream: false,
+      incomingApiType: 'messages',
+    };
+    return {
+      host,
+      providerPayload,
+      request,
+      requestWithTargetModel: request,
+      route: makeRoute(),
+      targetApiType: 'messages',
+      transformer: { name: 'test-transformer' },
+      bypassTransformation: false,
+      adapters: [],
+      stallConfig: null,
+      attemptTimeout: {
+        signal: new AbortController().signal,
+        isTimedOut: () => false,
+        cleanup: mock(),
+      },
+      failoverEnabled: true,
+      hasNextTarget: true,
+      retryableStatusCodes: [500, 502, 503],
+      retryableErrors: [],
+      retryHistory: [],
+      attemptedProviders: [],
+      sessionKey: null,
+      release: mock(),
+    };
+  }
+
+  it('drops the auto fast-mode beta when a strip-and-retry removes speed, keeping client betas', async () => {
+    const speed400 = new Response(
+      JSON.stringify({ error: { message: "Unsupported parameter: 'speed'" } }),
+      { status: 400 }
+    );
+    const ok = new Response('{"id":"msg_1"}', { status: 200 });
+    const executeProviderRequest = mock().mockResolvedValueOnce(speed400).mockResolvedValueOnce(ok);
+    const handleNonStreamingResponse = mock(async () => ({ content: 'ok' }) as any);
+    const setupHeaders = mock(() => ({ 'anthropic-beta': 'client-beta' }));
+    const host = makeHost({
+      executeProviderRequest,
+      handleNonStreamingResponse,
+      setupHeaders,
+    });
+
+    const result = await executeStandardAttempt(
+      makeFastModeContext(host, { model: 'model-1', speed: 'fast' })
+    );
+    expect(result.outcome).toBe('success');
+    expect(executeProviderRequest).toHaveBeenCalledTimes(2);
+
+    // Initial attempt: speed fast implies the auto beta alongside the client's.
+    const firstHeaders = executeProviderRequest.mock.calls[0]![1] as Record<string, string>;
+    expect(firstHeaders['anthropic-beta']).toContain('client-beta');
+    expect(firstHeaders['anthropic-beta']).toContain('fast-mode-2026-02-01');
+
+    // After `speed` was stripped, the auto beta must not linger; client beta stays.
+    const secondHeaders = executeProviderRequest.mock.calls[1]![1] as Record<string, string>;
+    expect(secondHeaders['anthropic-beta']).toContain('client-beta');
+    expect(secondHeaders['anthropic-beta']).not.toContain('fast-mode-2026-02-01');
+  });
+});
+
+describe('executeStandardAttempt — thinking-signature strip-and-retry', () => {
+  const signature400Body = JSON.stringify({
+    type: 'error',
+    error: {
+      type: 'invalid_request_error',
+      message: 'messages.3.content.0: Invalid `signature` in `thinking` block',
+    },
+  });
+
+  function makeNonStreamingRequest(): UnifiedChatRequest {
+    return {
+      requestId: 'req-1',
+      model: 'model-1',
+      messages: [{ role: 'user', content: 'hi' } as any],
+      stream: false,
+      incomingApiType: 'chat',
+    };
+  }
+
+  function makeContext(
+    host: RequestManagerHost,
+    providerPayload: any,
+    overrides: Partial<StandardAttemptContext> = {}
+  ): StandardAttemptContext {
+    const request = makeNonStreamingRequest();
+    return {
+      host,
+      providerPayload,
+      request,
+      requestWithTargetModel: request,
+      route: makeRoute(),
+      targetApiType: 'messages',
+      transformer: { name: 'test-transformer' },
+      bypassTransformation: false,
+      adapters: [],
+      stallConfig: null,
+      attemptTimeout: {
+        signal: new AbortController().signal,
+        isTimedOut: () => false,
+        cleanup: mock(),
+      },
+      failoverEnabled: true,
+      hasNextTarget: true,
+      retryableStatusCodes: [500, 502, 503],
+      retryableErrors: [],
+      retryHistory: [],
+      attemptedProviders: [],
+      sessionKey: null,
+      release: mock(),
+      ...overrides,
+    };
+  }
+
+  it('does not retry the same target when a signature-matching 400 hits a payload with no thinking blocks (single fetch, normal failover)', async () => {
+    // Fresh Response per call: a Response body is single-read, so a shared
+    // instance would throw on a second (buggy) fetch's .text() and mask the
+    // real assertion failure.
+    const executeProviderRequest = mock(
+      async () => new Response(signature400Body, { status: 400 })
+    );
+    const handleProviderError = mock(async () => {
+      throw new Error('HTTP 400: invalid signature');
+    });
+    const isRetryableStatus = mock(() => true);
+    const host = makeHost({ executeProviderRequest, handleProviderError, isRetryableStatus });
+
+    // The known false-positive shape: an OpenAI-chat-format payload also has
+    // a `messages` array (so the structural Anthropic-payload check matches)
+    // but carries NO thinking blocks — a strip would remove zero blocks and
+    // a retry would resend a byte-identical request.
+    const providerPayload = {
+      model: 'model-1',
+      messages: [{ role: 'user', content: 'hi' }],
+    };
+    const snapshot = structuredClone(providerPayload);
+
+    const result = await executeStandardAttempt(makeContext(host, providerPayload));
+
+    // Normal failover proceeds (retry outcome hands control back to the
+    // caller's next-target loop)...
+    expect(result.outcome).toBe('retry');
+    // ...but the SAME target was fetched exactly once: the zero-block strip
+    // must not burn a same-target retry on an identical payload.
+    expect(executeProviderRequest).toHaveBeenCalledTimes(1);
+    // Nothing was stripped, so the payload is untouched.
+    expect(providerPayload).toEqual(snapshot);
+  });
+
+  it('strips thinking blocks copy-on-write on a genuine signature 400: original payload object never mutated, retried payload stripped', async () => {
+    const executeProviderRequest = mock()
+      .mockImplementationOnce(async () => new Response(signature400Body, { status: 400 }))
+      .mockImplementationOnce(async () => new Response('{"id":"msg_1"}', { status: 200 }));
+    const handleNonStreamingResponse = mock(async () => ({ content: 'ok' }) as any);
+    const host = makeHost({ executeProviderRequest, handleNonStreamingResponse });
+
+    const providerPayload = {
+      model: 'model-1',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'stale', signature: 'sig-a' },
+            { type: 'text', text: 'answer' },
+          ],
+        },
+      ],
+    };
+    const snapshot = structuredClone(providerPayload);
+
+    const result = await executeStandardAttempt(makeContext(host, providerPayload));
+
+    expect(result.outcome).toBe('success');
+    expect(executeProviderRequest).toHaveBeenCalledTimes(2);
+
+    // First fetch sent the original payload object...
+    expect(executeProviderRequest.mock.calls[0]![2]).toBe(providerPayload);
+    // ...the same-target retry sent a NEW payload with the blocks stripped...
+    const retriedPayload = executeProviderRequest.mock.calls[1]![2];
+    expect(retriedPayload).not.toBe(providerPayload);
+    expect(retriedPayload.messages).toEqual([
+      { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'answer' }] },
+    ]);
+    // ...and the ORIGINAL payload (which can share `messages` with the
+    // long-lived request) was never mutated in place.
+    expect(providerPayload).toEqual(snapshot);
+  });
+
+  it('clears the requested tier when a strip retry removes service_tier and the final attempt fails terminally', async () => {
+    const stripBody = JSON.stringify({
+      error: { message: 'Unsupported parameter: service_tier' },
+    });
+    const executeProviderRequest = mock().mockImplementation(
+      async () => new Response(stripBody, { status: 400 })
+    );
+    const handleProviderError = mock(async () => {
+      throw new Error('HTTP 400: unsupported parameter');
+    });
+    const host = makeHost({ executeProviderRequest, handleProviderError });
+
+    const providerPayload = { model: 'model-1', service_tier: 'flex' };
+    const context = makeContext(host, providerPayload, {
+      targetApiType: 'chat',
+      hasNextTarget: false,
+    });
+
+    await expect(executeStandardAttempt(context)).rejects.toMatchObject({
+      routingContext: { requestedServiceTier: null, requestedServiceTierRaw: null },
+    });
+
+    // Initial attempt sent service_tier; the same-target strip retry did not.
+    expect(executeProviderRequest).toHaveBeenCalledTimes(2);
+    expect(executeProviderRequest.mock.calls[0]![2]).toHaveProperty('service_tier', 'flex');
+    expect(executeProviderRequest.mock.calls[1]![2]).not.toHaveProperty('service_tier');
+    // The original payload was never mutated by the copy-on-write strip.
+    expect(providerPayload).toEqual({ model: 'model-1', service_tier: 'flex' });
+  });
+
+  it('retries on early stream error from probeStreamingStart', async () => {
+    const executeProviderRequest = mock(
+      async () =>
+        new Response('data: {"error":{"code":429,"message":"Rate limit"}}\n\n', { status: 200 })
+    );
+    const streamError = new Error('openai/gpt-5.6-luna is temporarily rate-limited upstream');
+    (streamError as any).isStreamError = true;
+    (streamError as any).statusCode = 429;
+    (streamError as any).cooldownDuration = 30000;
+
+    const probeStreamingStart = mock().mockResolvedValue({
+      ok: false,
+      error: streamError,
+      streamStarted: false,
+    });
+    const host = makeHost({ executeProviderRequest, probeStreamingStart });
+
+    const request = makeStreamingRequest();
+    const result = await executeStandardAttempt(
+      makeContext(host, {}, { request, requestWithTargetModel: request, targetApiType: 'chat' })
+    );
+    expect(result.outcome).toBe('retry');
+    expect(host.appendFailureAttempt).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      streamError,
+      'chat',
+      true,
+      'model-1'
+    );
+  });
+
+  it('reactively force-refreshes OAuth credentials and retries the same target on 401', async () => {
+    const route: RouteResult = {
+      provider: 'codexgo',
+      model: 'gpt-5.6-luna',
+      config: {
+        api_base_url: 'oauth://',
+        oauth_provider: 'openai-codex',
+        oauth_account: 'codexgo',
+      } as any,
+    } as RouteResult;
+
+    (route as any)[NATIVE_OAUTH_STASH] = {
+      url: 'https://chatgpt.com/backend-api/codex/responses',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer old-token',
+        'chatgpt-account-id': 'acct-old',
+      },
+      body: { model: 'gpt-5.6-luna' },
+      reverseResponseFrame: (f: string) => f,
+    };
+
+    const authManager = OAuthAuthManager.getInstance();
+    const getApiKeySpy = registerSpy(authManager, 'getApiKey').mockResolvedValue('new-token');
+
+    const executeProviderRequest = mock()
+      .mockImplementationOnce(
+        async () => new Response('{"error":{"code":"token_expired"}}', { status: 401 })
+      )
+      .mockImplementationOnce(async () => new Response('{"id":"resp_ok"}', { status: 200 }));
+    const handleNonStreamingResponse = mock(async () => ({ content: 'success' }) as any);
+    const handleProviderError = mock();
+    const host = makeHost({
+      executeProviderRequest,
+      handleNonStreamingResponse,
+      handleProviderError,
+      buildRequestUrl: mock(() => (route as any)[NATIVE_OAUTH_STASH].url),
+      setupHeaders: mock(() => ({ ...(route as any)[NATIVE_OAUTH_STASH].headers })),
+    });
+
+    const result = await executeStandardAttempt(
+      makeContext(host, { model: 'gpt-5.6-luna' }, { route, targetApiType: 'responses' })
+    );
+
+    expect(result.outcome).toBe('success');
+    expect(executeProviderRequest).toHaveBeenCalledTimes(2);
+    expect(getApiKeySpy).toHaveBeenCalledWith('openai-codex', 'codexgo', {
+      forceRefresh: true,
+      signal: expect.anything(),
+    });
+    // First call sent old token
+    expect(executeProviderRequest.mock.calls[0]![1].Authorization).toBe('Bearer old-token');
+    // Second call sent new token
+    expect(executeProviderRequest.mock.calls[1]![1].Authorization).toBe('Bearer new-token');
+    // Error handler was not called (no cooldown)
+    expect(handleProviderError).not.toHaveBeenCalled();
+  });
+
+  it('bounds 401 retry to a single attempt and fails over if retry also returns 401', async () => {
+    const route: RouteResult = {
+      provider: 'codexgo',
+      model: 'gpt-5.6-luna',
+      config: {
+        api_base_url: 'oauth://',
+        oauth_provider: 'openai-codex',
+        oauth_account: 'codexgo',
+      } as any,
+    } as RouteResult;
+
+    (route as any)[NATIVE_OAUTH_STASH] = {
+      url: 'https://chatgpt.com/backend-api/codex/responses',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer old-token',
+      },
+      body: { model: 'gpt-5.6-luna' },
+      reverseResponseFrame: (f: string) => f,
+    };
+
+    const authManager = OAuthAuthManager.getInstance();
+    registerSpy(authManager, 'getApiKey').mockResolvedValue('new-token');
+
+    const executeProviderRequest = mock().mockImplementation(
+      async () => new Response('{"error":{"code":"token_expired"}}', { status: 401 })
+    );
+    const handleProviderError = mock(async () => {
+      throw new Error('HTTP 401: Unauthorized');
+    });
+    const host = makeHost({
+      executeProviderRequest,
+      handleProviderError,
+      buildRequestUrl: mock(() => (route as any)[NATIVE_OAUTH_STASH].url),
+      setupHeaders: mock(() => ({ ...(route as any)[NATIVE_OAUTH_STASH].headers })),
+    });
+
+    await expect(
+      executeStandardAttempt(
+        makeContext(host, { model: 'gpt-5.6-luna' }, { route, targetApiType: 'responses' })
+      )
+    ).rejects.toThrow('HTTP 401: Unauthorized');
+
+    // Initial attempt + exactly 1 retry
+    expect(executeProviderRequest).toHaveBeenCalledTimes(2);
+    expect(handleProviderError).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not attempt OAuth refresh on 401 for non-OAuth routes', async () => {
+    const route: RouteResult = {
+      provider: 'openai',
+      model: 'gpt-4o',
+      config: {
+        api_base_url: 'https://api.openai.com/v1',
+      } as any,
+    } as RouteResult;
+
+    const authManager = OAuthAuthManager.getInstance();
+    const getApiKeySpy = registerSpy(authManager, 'getApiKey');
+
+    const executeProviderRequest = mock().mockImplementationOnce(
+      async () => new Response('{"error":"invalid_api_key"}', { status: 401 })
+    );
+    const handleProviderError = mock(async () => {
+      throw new Error('HTTP 401: Invalid API key');
+    });
+    const host = makeHost({
+      executeProviderRequest,
+      handleProviderError,
+    });
+
+    await expect(
+      executeStandardAttempt(
+        makeContext(host, { model: 'gpt-4o' }, { route, targetApiType: 'chat' })
+      )
+    ).rejects.toThrow('HTTP 401: Invalid API key');
+
+    expect(executeProviderRequest).toHaveBeenCalledTimes(1);
+    expect(getApiKeySpy).not.toHaveBeenCalled();
+    expect(handleProviderError).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('executeStandardAttempt sticky expiration', () => {
+  it.each([false, true])(
+    'captures final retry payload and start time (stream=%s)',
+    async (stream) => {
+      const clock = registerSpy(Date, 'now').mockReturnValue(1_000);
+      const executeProviderRequest = mock()
+        .mockImplementationOnce(async () => {
+          clock.mockReturnValue(10_000);
+          return new Response(
+            JSON.stringify({
+              error: { message: "Unsupported parameter: 'prompt_cache_retention'" },
+            }),
+            { status: 400 }
+          );
+        })
+        .mockImplementationOnce(async () => {
+          clock.mockReturnValue(100_000);
+          return new Response(null, { status: 200 });
+        });
+      const host = makeHost({
+        executeProviderRequest,
+        probeStreamingStart: mock(async (response) => ({ ok: true, response })),
+        handleNonStreamingResponse: mock(async () => ({ content: 'ok' }) as any),
+      });
+      const request = { ...makeStreamingRequest(), stream };
+      const route = makeRoute();
+      const result = await executeStandardAttempt({
+        host,
+        providerPayload: { model: 'model-1', prompt_cache_retention: '24h' },
+        request,
+        requestWithTargetModel: request,
+        route,
+        targetApiType: 'chat',
+        transformer: { name: 'test-transformer' },
+        bypassTransformation: false,
+        adapters: [],
+        stallConfig: null,
+        attemptTimeout: {
+          signal: new AbortController().signal,
+          isTimedOut: () => false,
+          cleanup: mock(),
+        },
+        failoverEnabled: false,
+        hasNextTarget: false,
+        retryableStatusCodes: [],
+        retryableErrors: [],
+        retryHistory: [],
+        attemptedProviders: [],
+        sessionKey: 'session',
+        release: mock(),
+      });
+      expect(result.outcome).toBe('success');
+      expect(executeProviderRequest).toHaveBeenCalledTimes(2);
+      expect(host.recordStickySession).toHaveBeenCalledTimes(1);
+      expect(host.recordStickySession).toHaveBeenCalledWith('session', route, request, 310_000);
+    }
+  );
+});
+
+describe('failover-policy 402 status code handling', () => {
+  it('treats 402 Payment Required as retryable regardless of configured retryable status codes', () => {
+    expect(isRetryableStatus(402, [])).toBe(true);
+    expect(isRetryableStatus(402, [500, 502])).toBe(true);
+    expect(isRetryableStatus(500, [500])).toBe(true);
+    expect(isRetryableStatus(400, [500])).toBe(false);
+  });
+
+  it('treats 402 Payment Required as retryable for OAuth errors', () => {
+    expect(isRetryableOAuthError({ status: 402, message: 'Low balance' })).toBe(true);
+    expect(isRetryableOAuthError({ statusCode: 402, message: 'Payment required' })).toBe(true);
+    expect(isRetryableOAuthError({ status: 429, message: 'Rate limit' })).toBe(true);
+    expect(isRetryableOAuthError({ status: 401, message: 'Unauthorized' })).toBe(false);
+  });
+});
