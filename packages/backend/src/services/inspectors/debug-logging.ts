@@ -1,0 +1,939 @@
+import { PassThrough } from 'stream';
+
+import { createParser } from 'eventsource-parser';
+
+import { logger } from '../../utils/logger';
+import { DebugManager } from '../observability/debug-manager';
+import { BaseInspector } from './base';
+
+const MAX_DEBUG_BUFFER_SIZE = 10 * 1024 * 1024; // 10MB
+const RESPONSES_TERMINAL_EVENT_TYPES = new Set([
+  'response.completed',
+  'response.failed',
+  'response.incomplete',
+]);
+/** OpenAI-compatible chat/completions streams end with this literal frame. */
+const CHAT_TERMINAL_EVENT_DATA = '[DONE]';
+
+/**
+ * Provider API types whose "raw" stream is a stream of unified chunk OBJECTS
+ * rather than provider SSE bytes. A non-objectMode PassThrough THROWS when an
+ * object is written to it, which would tear down the client's stream, so the
+ * tap must be created in object mode for these:
+ *   - `images`: the auto-bridge (services/dispatch/image-model-bridge.ts)
+ *     synthesizes unified chunks directly, with no provider wire in between.
+ */
+const OBJECT_CHUNK_API_TYPES = new Set(['oauth', 'images']);
+
+export class DebugLoggingInspector extends BaseInspector {
+  private debugManager = DebugManager.getInstance();
+  private mode: 'raw' | 'transformed';
+  // Capture state lives on the INSTANCE (not in createInspector closures) so
+  // finalize() can run the reconstruction from outside the stream lifecycle —
+  // see finalize() below for why that matters on cancellations.
+  private providerApiType: string = 'unknown';
+  private bodyChunks: string[] = [];
+  private totalSize = 0;
+  private truncated = false;
+  private finalized = false;
+  private terminalEventParser: ReturnType<typeof createParser> | null = null;
+
+  constructor(
+    requestId: string,
+    mode: 'raw' | 'transformed' = 'raw',
+    private readonly onTerminal?: () => void
+  ) {
+    super(requestId);
+    this.mode = mode;
+  }
+
+  createInspector(providerApiType: string): PassThrough {
+    this.providerApiType = providerApiType;
+    this.initializeTerminalEventDetection();
+
+    // Capture happens synchronously in the transform hook (i.e. at write()
+    // time), NOT in a 'data' listener: 'data' emission for the very first
+    // writes is deferred to the tick after resume() starts the flow, so a
+    // teardown-time finalize() could miss bytes that were already written.
+    // With write-time capture, finalize() deterministically sees every chunk
+    // written up to the instant it runs.
+    const inspector = new PassThrough({
+      ...(OBJECT_CHUNK_API_TYPES.has(providerApiType) ? { objectMode: true } : {}),
+      transform: (chunk: any, _encoding, callback) => {
+        this.captureChunk(chunk);
+        callback(null, chunk);
+      },
+    });
+
+    // Nothing external ever reads this tap's readable side — keep it flowing
+    // (into zero listeners) so pushed chunks never accumulate to the
+    // high-water mark and stall the transform hook above.
+    inspector.resume();
+
+    inspector.on('end', () => this.finalize());
+
+    return inspector;
+  }
+
+  private captureChunk(chunk: any): void {
+    logger.silly(
+      `[Inspector:${this.mode}] Request ${this.requestId} received chunk, length: ${chunk.length || chunk.toString().length}: ${chunk.toString()}`
+    );
+
+    let chunkStr: string;
+    if (typeof chunk === 'string') {
+      chunkStr = chunk;
+    } else if (Buffer.isBuffer(chunk)) {
+      chunkStr = chunk.toString('utf8');
+    } else if (chunk instanceof Uint8Array) {
+      chunkStr = new TextDecoder().decode(chunk);
+    } else if (chunk && typeof chunk === 'object') {
+      chunkStr = `${JSON.stringify(chunk)}\n`;
+    } else {
+      try {
+        chunkStr = String(chunk);
+      } catch (e) {
+        logger.warn(`[${this.mode}] Failed to convert chunk to string`);
+        return;
+      }
+    }
+
+    // Terminal detection keeps running even after the debug body is
+    // truncated: a >10MB stream still needs its terminal frame observed so
+    // usage and captures finalize before the client can close. The parser is
+    // fed AFTER the chunk is accumulated so a terminal event finalized during
+    // this feed sees the complete body.
+    if (this.truncated) {
+      this.terminalEventParser?.feed(chunkStr);
+      return;
+    }
+
+    const newSize = this.totalSize + chunkStr.length;
+
+    if (newSize > MAX_DEBUG_BUFFER_SIZE) {
+      this.truncated = true;
+      this.bodyChunks.push('\n\n[DEBUG OUTPUT TRUNCATED - Exceeded 10MB limit]');
+      logger.warn(`Request ${this.requestId} debug output truncated at ${this.totalSize} bytes`);
+      this.terminalEventParser?.feed(chunkStr);
+      return;
+    }
+
+    this.totalSize = newSize;
+    this.bodyChunks.push(chunkStr);
+    this.terminalEventParser?.feed(chunkStr);
+  }
+
+  private initializeTerminalEventDetection(): void {
+    if (this.providerApiType === 'responses') {
+      this.terminalEventParser = createParser({
+        onEvent: (event) => {
+          try {
+            const responseEvent = JSON.parse(event.data);
+            if (RESPONSES_TERMINAL_EVENT_TYPES.has(responseEvent.type)) {
+              this.finalizeOnTerminal();
+            }
+          } catch {
+            // Non-JSON SSE frames cannot be Responses terminal events.
+          }
+        },
+      });
+      return;
+    }
+
+    if (this.providerApiType === 'chat') {
+      this.terminalEventParser = createParser({
+        onEvent: (event) => {
+          if (event.data.trim() === CHAT_TERMINAL_EVENT_DATA) {
+            this.finalizeOnTerminal();
+          }
+        },
+      });
+    }
+  }
+
+  private finalizeOnTerminal(): void {
+    if (this.finalized) return;
+    // OpenAI-compatible chat clients (e.g. OMP) close their connection
+    // immediately after `data: [DONE]`, just as Codex does after
+    // `response.completed`. Finalize before the chunk continues to the client
+    // so the completed response and usage are available during teardown.
+    this.finalize();
+    this.onTerminal?.();
+  }
+
+  /**
+   * Reconstructs and persists everything captured so far (snapshot to memory
+   * always; raw body per capture policy). One-shot: the stream's natural
+   * 'end' event and any explicit teardown call share the same guard, so
+   * whichever runs first wins and later calls are no-ops.
+   *
+   * PUBLIC because stream flush is not guaranteed to run before the trace is
+   * persisted: a client terminal event can finalize usage while the upstream
+   * tap is still open, and a disconnect/timeout can cancel the web pipeline
+   * without running its flush at all. UsageInspector and response-handler
+   * explicitly finalize the taps before reading usage or flushing the trace.
+   */
+  finalize(): void {
+    if (this.finalized) return;
+    this.finalized = true;
+
+    const rawBody = this.bodyChunks.join('');
+    logger.silly(
+      `[Inspector:${this.mode}] Request ${this.requestId} capture finalized, captured ${this.bodyChunks.length} chunks, total size: ${rawBody.length} bytes`
+    );
+    try {
+      let reconstructed: any = null;
+      switch (this.providerApiType) {
+        case 'chat':
+          reconstructed = this.reconstructChatCompletions(rawBody);
+          break;
+        case 'responses':
+          reconstructed = this.reconstructResponses(rawBody);
+          break;
+        case 'messages':
+          reconstructed = this.reconstructMessages(rawBody);
+          break;
+        case 'gemini':
+          reconstructed = this.reconstructGemini(rawBody);
+          break;
+        // Bedrock Converse unary responses are a single JSON object; the chat
+        // reconstructor returns the parsed object unchanged for that shape.
+        // ConverseStream is an AWS event-stream binary and is intentionally
+        // NOT reconstructed here (no SSE frames to read); raw-passthrough
+        // observes its `metadata` event with BedrockEventStreamMetadataObserver.
+        case 'bedrock-converse':
+          reconstructed = this.reconstructChatCompletions(rawBody);
+          break;
+        case 'bedrock-converse-stream':
+          break;
+        case 'oauth':
+          reconstructed = this.reconstructOAuth(rawBody);
+          break;
+        // Bridged image output (services/dispatch/image-model-bridge.ts) is
+        // already unified — there is no provider wire format to reconstruct,
+        // and its usage is recorded from the client-facing transformed
+        // snapshot instead. No-op rather than a spurious "Unknown
+        // providerApiType" warning on every bridged stream.
+        case 'images':
+        case 'unknown':
+          break;
+        default:
+          logger.warn(`Unknown providerApiType: ${this.providerApiType}`);
+      }
+      // Always save to memory for usage extraction/estimation
+      this.saveReconstructedResponse(reconstructed);
+
+      // DebugManager applies global/key/alias/provider capture policy.
+      this.saveRawResponse(rawBody);
+    } catch (err) {
+      logger.error(`[Inspector:${this.mode}] Reconstruction failed: ${err}`);
+      this.saveRawResponse(rawBody);
+    }
+  }
+
+  private saveRawResponse(fullBody: string): void {
+    if (this.mode === 'raw') {
+      this.debugManager.addRawResponse(this.requestId, fullBody);
+    } else {
+      this.debugManager.addTransformedResponse(this.requestId, fullBody);
+    }
+  }
+
+  private saveReconstructedResponse(snapshot: any): void {
+    if (this.mode === 'raw') {
+      this.debugManager.addReconstructedRawResponse(this.requestId, snapshot);
+    } else {
+      this.debugManager.addTransformedResponseSnapshot(this.requestId, snapshot);
+    }
+  }
+
+  /**
+   * Extract provider-reported cost from SSE comment lines.
+   * Some providers emit `: cost {"request_cost_usd": ...}` as SSE comments
+   * alongside the standard `data:` events. These are ignored by eventsource-parser
+   * but contain valuable actual cost information.
+   */
+  private extractProviderCostFromSSEComments(fullBody: string): any | null {
+    const lines = fullBody.split(/\r?\n/);
+    let lastCost: any = null;
+
+    for (const line of lines) {
+      // Match `: cost {json}` pattern (SSE comment with cost data)
+      const costMatch = line.match(/^:\s*cost\s+(\{.+\})\s*$/);
+      if (costMatch) {
+        try {
+          lastCost = JSON.parse(costMatch[1]!);
+        } catch (e) {
+          // Skip malformed cost lines
+        }
+      }
+    }
+
+    return lastCost;
+  }
+
+  /**
+   * Extract provider-reported energy from SSE comment lines (e.g., neuralwatt).
+   * Providers emit `: energy {"energy_kwh": ...}` as SSE comments
+   * alongside the standard `data:` events. These contain actual energy usage.
+   */
+  private extractProviderEnergyFromSSEComments(fullBody: string): any | null {
+    const lines = fullBody.split(/\r?\n/);
+    let lastEnergy: any = null;
+
+    for (const line of lines) {
+      // Match `: energy {json}` pattern (SSE comment with energy data)
+      const energyMatch = line.match(/^:\s*energy\s+(\{.+\})\s*$/);
+      if (energyMatch) {
+        try {
+          lastEnergy = JSON.parse(energyMatch[1]!);
+        } catch (e) {
+          // Skip malformed energy lines
+        }
+      }
+    }
+
+    return lastEnergy;
+  }
+
+  private reconstructChatCompletions(fullBody: string): any {
+    const trimmed = fullBody.trim();
+    if (!trimmed) return null;
+
+    // Try parsing as a single JSON object (non-streaming)
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        // Check for provider-reported cost in SSE comments even for non-streaming
+        const providerCost = this.extractProviderCostFromSSEComments(fullBody);
+        if (providerCost) {
+          parsed.providerReportedCost = providerCost;
+        }
+        return parsed;
+      } catch (e) {
+        // Not a single JSON object, continue to stream parsing
+      }
+    }
+
+    const lines = fullBody.split(/\r?\n/);
+    let snapshot: any = null;
+
+    // Extract provider-reported cost and energy from SSE comment lines
+    const providerCost = this.extractProviderCostFromSSEComments(fullBody);
+    const providerEnergy = this.extractProviderEnergyFromSSEComments(fullBody);
+
+    for (const line of lines) {
+      if (!line.startsWith('data:')) continue;
+      const jsonStr = line.replace(/^data:\s*/, '').trim();
+      if (!jsonStr || jsonStr === '[DONE]') continue;
+
+      try {
+        const chunk = JSON.parse(jsonStr);
+        snapshot = this.updateChatCompletionsSnapshot(snapshot, chunk);
+      } catch (e) {
+        // Skip malformed/non-JSON lines
+      }
+    }
+
+    // Attach provider-reported cost if found in SSE comments
+    if (providerCost && snapshot) {
+      snapshot.providerReportedCost = providerCost;
+    }
+
+    // Attach provider-reported energy if found in SSE comments
+    if (providerEnergy && snapshot) {
+      snapshot.providerReportedEnergy = providerEnergy;
+    }
+
+    return snapshot;
+  }
+
+  private reconstructResponses(fullBody: string): any {
+    const trimmed = fullBody.trim();
+    if (!trimmed) return null;
+
+    // Try parsing as a single JSON object (non-streaming)
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        const providerCost = this.extractProviderCostFromSSEComments(fullBody);
+        const providerEnergy = this.extractProviderEnergyFromSSEComments(fullBody);
+        if (providerCost) {
+          parsed.providerReportedCost = providerCost;
+        }
+        if (providerEnergy) {
+          parsed.providerReportedEnergy = providerEnergy;
+        }
+        return parsed;
+      } catch (e) {
+        // Not a single JSON object, continue to stream parsing
+      }
+    }
+
+    const lines = fullBody.split(/\r?\n/);
+    let snapshot: any = null;
+
+    // Extract provider-reported cost and energy from SSE comment lines
+    const providerCost = this.extractProviderCostFromSSEComments(fullBody);
+    const providerEnergy = this.extractProviderEnergyFromSSEComments(fullBody);
+
+    for (const line of lines) {
+      if (!line.startsWith('data:')) continue;
+      const jsonStr = line.replace(/^data:\s*/, '').trim();
+      if (!jsonStr || jsonStr === '[DONE]') continue;
+
+      try {
+        const event = JSON.parse(jsonStr);
+        snapshot = this.updateResponsesSnapshot(snapshot, event);
+      } catch (e) {
+        // Skip malformed/non-JSON lines
+      }
+    }
+
+    if (providerCost && snapshot) {
+      snapshot.providerReportedCost = providerCost;
+    }
+
+    if (providerEnergy && snapshot) {
+      snapshot.providerReportedEnergy = providerEnergy;
+    }
+
+    return snapshot;
+  }
+
+  private reconstructMessages(fullBody: string): any {
+    const trimmed = fullBody.trim();
+    if (!trimmed) return null;
+
+    // Try parsing as a single JSON object (non-streaming)
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        const providerCost = this.extractProviderCostFromSSEComments(fullBody);
+        const providerEnergy = this.extractProviderEnergyFromSSEComments(fullBody);
+        if (providerCost) {
+          parsed.providerReportedCost = providerCost;
+        }
+        if (providerEnergy) {
+          parsed.providerReportedEnergy = providerEnergy;
+        }
+        return parsed;
+      } catch (e) {
+        // Not a single JSON object, continue to stream parsing
+      }
+    }
+
+    const lines = fullBody.split(/\r?\n/);
+    let snapshot: any = null;
+
+    // Extract provider-reported cost and energy from SSE comment lines
+    const providerCost = this.extractProviderCostFromSSEComments(fullBody);
+    const providerEnergy = this.extractProviderEnergyFromSSEComments(fullBody);
+
+    for (const line of lines) {
+      if (!line.startsWith('data:')) continue;
+      const jsonStr = line.replace(/^data:\s*/, '').trim();
+      if (!jsonStr) continue;
+
+      try {
+        const chunk = JSON.parse(jsonStr);
+        snapshot = this.updateMessagesSnapshot(snapshot, chunk);
+      } catch (e) {
+        // Skip malformed/non-JSON lines
+      }
+    }
+
+    if (providerCost && snapshot) {
+      snapshot.providerReportedCost = providerCost;
+    }
+
+    if (providerEnergy && snapshot) {
+      snapshot.providerReportedEnergy = providerEnergy;
+    }
+
+    return snapshot;
+  }
+
+  private reconstructGemini(fullBody: string): any {
+    const trimmed = fullBody.trim();
+    if (!trimmed) return null;
+
+    // Try parsing as a single JSON object (non-streaming)
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        const providerCost = this.extractProviderCostFromSSEComments(fullBody);
+        const providerEnergy = this.extractProviderEnergyFromSSEComments(fullBody);
+        if (providerCost) {
+          parsed.providerReportedCost = providerCost;
+        }
+        if (providerEnergy) {
+          parsed.providerReportedEnergy = providerEnergy;
+        }
+        return parsed;
+      } catch (e) {
+        // Not a single JSON object, continue to stream parsing
+      }
+    }
+
+    const lines = fullBody.split(/\r?\n/);
+    let snapshot: any = null;
+
+    for (const line of lines) {
+      if (!line.startsWith('data:')) continue;
+      const jsonStr = line.replace(/^data:\s*/, '').trim();
+      if (!jsonStr || jsonStr === '[DONE]') continue;
+
+      try {
+        const chunk = JSON.parse(jsonStr);
+        snapshot = this.updateGeminiSnapshot(snapshot, chunk);
+      } catch (e) {
+        // Skip malformed/non-JSON lines
+      }
+    }
+
+    // Attach provider-reported cost and energy if found in SSE comments
+    const providerCost = this.extractProviderCostFromSSEComments(fullBody);
+    const providerEnergy = this.extractProviderEnergyFromSSEComments(fullBody);
+    if (providerCost && snapshot) {
+      snapshot.providerReportedCost = providerCost;
+    }
+    if (providerEnergy && snapshot) {
+      snapshot.providerReportedEnergy = providerEnergy;
+    }
+
+    return snapshot;
+  }
+
+  private reconstructOAuth(fullBody: string): any {
+    const lines = fullBody.split(/\r?\n/);
+    const snapshot: any = {
+      content: '',
+      reasoning_content: '',
+      tool_calls: [],
+      usage: undefined,
+      finishReason: null,
+    };
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      try {
+        const event = JSON.parse(trimmed);
+        switch (event.type) {
+          case 'text_delta':
+            snapshot.content += event.delta || '';
+            break;
+          case 'thinking_delta':
+            snapshot.reasoning_content += event.delta || '';
+            break;
+          case 'toolcall_start': {
+            const index = event.contentIndex ?? 0;
+            snapshot.tool_calls[index] = snapshot.tool_calls[index] || {
+              id: '',
+              type: 'function',
+              function: { name: '', arguments: '' },
+            };
+            break;
+          }
+          case 'toolcall_delta': {
+            const index = event.contentIndex ?? 0;
+            const toolCall = event.partial?.content?.[index];
+            snapshot.tool_calls[index] = snapshot.tool_calls[index] || {
+              id: '',
+              type: 'function',
+              function: { name: '', arguments: '' },
+            };
+            if (toolCall?.id) snapshot.tool_calls[index].id = toolCall.id;
+            if (toolCall?.name) snapshot.tool_calls[index].function.name = toolCall.name;
+            if (typeof event.delta === 'string') {
+              snapshot.tool_calls[index].function.arguments += event.delta;
+            }
+            break;
+          }
+          case 'toolcall_end': {
+            const index = event.contentIndex ?? 0;
+            snapshot.tool_calls[index] = snapshot.tool_calls[index] || {
+              id: '',
+              type: 'function',
+              function: { name: '', arguments: '' },
+            };
+            snapshot.tool_calls[index].id = event.toolCall?.id || snapshot.tool_calls[index].id;
+            snapshot.tool_calls[index].function.name =
+              event.toolCall?.name || snapshot.tool_calls[index].function.name;
+            if (event.toolCall?.arguments) {
+              snapshot.tool_calls[index].function.arguments = JSON.stringify(
+                event.toolCall.arguments
+              );
+            }
+            break;
+          }
+          case 'done':
+            snapshot.usage = this.mapOAuthUsage(event.message?.usage);
+            snapshot.finishReason = event.reason || null;
+            break;
+          case 'error':
+            snapshot.usage = this.mapOAuthUsage(event.error?.usage);
+            snapshot.finishReason = event.reason || 'error';
+            break;
+        }
+      } catch (e) {
+        // Skip malformed lines
+      }
+    }
+
+    // Extract provider-reported cost and energy from SSE comment lines
+    const providerCost = this.extractProviderCostFromSSEComments(fullBody);
+    const providerEnergy = this.extractProviderEnergyFromSSEComments(fullBody);
+    if (providerCost) {
+      snapshot.providerReportedCost = providerCost;
+    }
+    if (providerEnergy) {
+      snapshot.providerReportedEnergy = providerEnergy;
+    }
+
+    return snapshot;
+  }
+
+  private mapOAuthUsage(usage: any): any {
+    if (!usage) return undefined;
+    return {
+      input_tokens: usage.input || 0,
+      output_tokens: usage.output || 0,
+      total_tokens: usage.totalTokens || 0,
+      reasoning_tokens: 0,
+      cached_tokens: usage.cacheRead || 0,
+      cache_creation_tokens: usage.cacheWrite || 0,
+    };
+  }
+
+  /**
+   * Applies a chunk to the existing snapshot for Gemini.
+   */
+  private updateGeminiSnapshot(acc: any, chunk: any): any {
+    if (!acc) {
+      acc = { ...chunk };
+      // Ensure candidates and parts arrays are initialized if missing in the first chunk
+      if (!acc.candidates) acc.candidates = [];
+      return acc;
+    }
+
+    // Update top-level fields
+    if (chunk.modelVersion) acc.modelVersion = chunk.modelVersion;
+    if (chunk.responseId) acc.responseId = chunk.responseId;
+    if (chunk.usageMetadata) acc.usageMetadata = chunk.usageMetadata;
+
+    if (chunk.candidates && chunk.candidates.length > 0) {
+      if (!acc.candidates) acc.candidates = [];
+
+      chunk.candidates.forEach((chunkCand: any, index: number) => {
+        // Ensure candidate exists
+        if (!acc.candidates[index]) {
+          acc.candidates[index] = { content: { parts: [], role: 'model' }, index };
+        }
+
+        const accCand = acc.candidates[index];
+
+        // Update finishReason if present
+        if (chunkCand.finishReason) {
+          accCand.finishReason = chunkCand.finishReason;
+        }
+
+        if (chunkCand.content && chunkCand.content.parts) {
+          if (!accCand.content) accCand.content = { parts: [], role: 'model' };
+          if (!accCand.content.parts) accCand.content.parts = [];
+
+          const accParts = accCand.content.parts;
+
+          chunkCand.content.parts.forEach((chunkPart: any) => {
+            // Logic to merge text parts, or append new parts
+            const lastPart = accParts.length > 0 ? accParts[accParts.length - 1] : null;
+
+            if (chunkPart.text) {
+              if (lastPart && lastPart.text !== undefined && !lastPart.functionCall) {
+                // Append text to the last text part
+                lastPart.text += chunkPart.text;
+                // Merge other properties if needed (e.g. thought)
+                if (chunkPart.thought) lastPart.thought = true;
+              } else {
+                // New text part
+                accParts.push({ ...chunkPart });
+              }
+            } else {
+              // Non-text part (e.g., functionCall), just push it
+              // Gemini usually sends function calls as complete objects in the stream (unlike OpenAI deltas)
+              accParts.push({ ...chunkPart });
+            }
+          });
+        }
+      });
+    }
+
+    return acc;
+  }
+
+  /**
+   * Applies a chunk to the existing snapshot using index-based merging for Anthropic Messages.
+   */
+  private updateMessagesSnapshot(acc: any, chunk: any): any {
+    // 1. Initial State (message_start)
+    if (!acc && chunk.type === 'message_start') {
+      acc = { ...chunk.message };
+      if (!acc.content) acc.content = [];
+      if (!acc.usage) acc.usage = {};
+      return acc;
+    }
+
+    if (!acc) return chunk;
+
+    switch (chunk.type) {
+      case 'message_start':
+        acc = { ...acc, ...chunk.message };
+        if (!acc.content) acc.content = [];
+        break;
+
+      case 'content_block_start':
+        const idx = chunk.index;
+        const block = chunk.content_block;
+        acc.content[idx] = { ...block };
+
+        // Initialize accumulators based on type
+        if (block.type === 'tool_use') {
+          acc.content[idx].partial_json = '';
+          acc.content[idx].input = {};
+        } else if (block.type === 'thinking' || block.type === 'thought') {
+          const key = block.type === 'thinking' ? 'thinking' : 'thought';
+          acc.content[idx][key] = acc.content[idx][key] || '';
+        } else if (block.type === 'text') {
+          acc.content[idx].text = acc.content[idx].text || '';
+        }
+        break;
+
+      case 'content_block_delta':
+        const dIdx = chunk.index;
+        const delta = chunk.delta;
+
+        if (!acc.content[dIdx]) {
+          // Fallback initialization if start was missed
+          if (delta.type === 'input_json_delta') {
+            acc.content[dIdx] = { type: 'tool_use', partial_json: '', input: {} };
+          } else if (delta.type === 'thinking_delta' || delta.type === 'thought_delta') {
+            const type = delta.type === 'thinking_delta' ? 'thinking' : 'thought';
+            acc.content[dIdx] = { type, [type]: '' };
+          } else {
+            acc.content[dIdx] = { type: 'text', text: '' };
+          }
+        }
+
+        const targetBlock = acc.content[dIdx];
+
+        if (delta.type === 'text_delta') {
+          targetBlock.text = (targetBlock.text || '') + delta.text;
+        } else if (delta.type === 'thinking_delta') {
+          targetBlock.thinking = (targetBlock.thinking || '') + delta.thinking;
+        } else if (delta.type === 'thought_delta') {
+          targetBlock.thought = (targetBlock.thought || '') + delta.thought;
+        } else if (delta.type === 'input_json_delta') {
+          targetBlock.partial_json = (targetBlock.partial_json || '') + delta.partial_json;
+          try {
+            targetBlock.input = JSON.parse(targetBlock.partial_json);
+          } catch (e) {
+            // Partial JSON - common during streaming
+          }
+        }
+        break;
+
+      case 'message_delta':
+        if (chunk.delta) {
+          if (chunk.delta.stop_reason) acc.stop_reason = chunk.delta.stop_reason;
+          if (chunk.delta.stop_sequence) acc.stop_sequence = chunk.delta.stop_sequence;
+        }
+        if (chunk.usage) {
+          acc.usage = { ...acc.usage, ...chunk.usage };
+        }
+        break;
+    }
+
+    return acc;
+  }
+
+  /**
+   * Applies a chunk to the existing snapshot using index-based merging.
+   */
+  private updateChatCompletionsSnapshot(acc: any, chunk: any): any {
+    // 1. Initial State
+    if (!acc) return { ...chunk };
+
+    // 2. Simple Key Overwrites (id, model, object, system_fingerprint, usage)
+    const result = { ...acc, ...chunk };
+
+    // 3. Choice Aggregation (The complex part)
+    if (chunk.choices) {
+      result.choices = acc.choices ? [...acc.choices] : [];
+
+      for (const chunkChoice of chunk.choices) {
+        const idx = chunkChoice.index ?? 0;
+
+        // Ensure the choice exists in our accumulator
+        if (!result.choices[idx]) {
+          result.choices[idx] = { index: idx, delta: {} };
+        }
+
+        const accChoice = result.choices[idx];
+        const delta = chunkChoice.delta;
+
+        if (delta) {
+          // A. Role/Finish Reason (Overwrite)
+          if (delta.role) accChoice.delta.role = delta.role;
+          if (chunkChoice.finish_reason) accChoice.finish_reason = chunkChoice.finish_reason;
+
+          // B. Text Buffers (Concatenate strings, IGNORE nulls)
+          // Includes content, reasoning_content, reasoning (zenmux/kimi), refusal, etc.
+          ['content', 'reasoning', 'reasoning_content', 'refusal'].forEach((key) => {
+            if (typeof delta[key] === 'string') {
+              accChoice.delta[key] = (accChoice.delta[key] || '') + delta[key];
+            }
+          });
+
+          // C2. Per-choice usage (e.g. zenmux puts usage inside choices[0] on final chunk)
+          if (chunkChoice.usage && !result.usage) {
+            result.usage = chunkChoice.usage;
+          }
+
+          // C. Tool Calls (Merged by tool index)
+          if (delta.tool_calls) {
+            if (!accChoice.delta.tool_calls) accChoice.delta.tool_calls = [];
+
+            for (const newTool of delta.tool_calls) {
+              const tIdx = newTool.index;
+              if (!accChoice.delta.tool_calls[tIdx]) {
+                accChoice.delta.tool_calls[tIdx] = { function: { name: '', arguments: '' } };
+              }
+
+              const accTool = accChoice.delta.tool_calls[tIdx];
+              if (!accTool.function) accTool.function = { name: '', arguments: '' };
+              if (typeof accTool.function.arguments !== 'string') {
+                accTool.function.arguments = '';
+              }
+              if (newTool.id) accTool.id = newTool.id;
+              if (newTool.type) accTool.type = newTool.type;
+              if (newTool.function?.name) accTool.function.name = newTool.function.name;
+
+              // Tool Arguments are streamed as string fragments
+              if (typeof newTool.function?.arguments === 'string') {
+                accTool.function.arguments += newTool.function.arguments;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Applies a Responses API streaming event to the existing snapshot.
+   */
+  private updateResponsesSnapshot(acc: any, event: any): any {
+    // Initialize snapshot from response.created event
+    if (!acc && event.type === 'response.created') {
+      acc = { ...event.response };
+      if (!acc.output) acc.output = [];
+      return acc;
+    }
+
+    if (!acc) {
+      acc = { output: [] };
+    }
+
+    switch (event.type) {
+      case 'response.created':
+      case 'response.in_progress':
+        // Update top-level response fields
+        if (event.response) {
+          Object.assign(acc, event.response);
+        }
+        break;
+
+      case 'response.output_item.added':
+        // Add new output item
+        const outputIndex = event.output_index ?? acc.output.length;
+        if (event.item) {
+          acc.output[outputIndex] = { ...event.item };
+        }
+        break;
+
+      case 'response.output_text.delta':
+        // Accumulate text deltas
+        const textItem = acc.output[event.output_index];
+        if (textItem && textItem.content && textItem.content[event.content_index]) {
+          if (!textItem.content[event.content_index].text) {
+            textItem.content[event.content_index].text = '';
+          }
+          textItem.content[event.content_index].text += event.delta;
+        }
+        break;
+
+      case 'response.function_call_arguments.delta':
+        // Accumulate function call arguments
+        const fcItem = acc.output[event.output_index];
+        if (fcItem && fcItem.type === 'function_call') {
+          if (!fcItem.arguments) {
+            fcItem.arguments = '';
+          }
+          fcItem.arguments += event.delta;
+        }
+        break;
+
+      case 'response.output_item.done':
+        // Finalize output item
+        if (event.item && event.output_index !== undefined) {
+          acc.output[event.output_index] = { ...event.item };
+        }
+        break;
+
+      case 'response.completed':
+        // Final response state
+        if (event.response) {
+          const accumulatedOutput = acc.output;
+          Object.assign(acc, event.response);
+          if (
+            Array.isArray(accumulatedOutput) &&
+            accumulatedOutput.length > 0 &&
+            Array.isArray(event.response.output) &&
+            event.response.output.length === 0
+          ) {
+            acc.output = accumulatedOutput;
+          }
+        }
+        break;
+
+      case 'response.failed':
+        // Upstream/client-facing hard failure. Same merge semantics as
+        // response.completed: absorb the final response object (status
+        // 'failed', error, and usage-if-present) so failed/truncated
+        // streams don't get stuck reporting a stale snapshot (usually
+        // 'in_progress') with zero usage.
+        if (event.response) {
+          Object.assign(acc, event.response);
+        }
+        break;
+
+      case 'response.incomplete':
+        // Upstream ended the response early (e.g. max_output_tokens or a
+        // content filter). Same merge semantics as response.completed /
+        // response.failed: absorb the final response object (status
+        // 'incomplete', incomplete_details, and usage-if-present) so
+        // truncated streams don't get stuck reporting a stale snapshot
+        // with zero usage.
+        if (event.response) {
+          Object.assign(acc, event.response);
+        }
+        break;
+    }
+
+    return acc;
+  }
+}
