@@ -1,0 +1,252 @@
+import { UnifiedUsage } from '../types/unified';
+
+type UsageSubset = Pick<
+  UnifiedUsage,
+  | 'input_tokens'
+  | 'output_tokens'
+  | 'total_tokens'
+  | 'reasoning_tokens'
+  | 'cached_tokens'
+  | 'cache_creation_tokens'
+  | 'input_image_tokens'
+  | 'output_image_tokens'
+>;
+
+const safeToken = (value: unknown): number => {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  return Math.max(0, Math.floor(num));
+};
+
+/**
+ * Sanitizes an optional token count, preserving the "not reported" state.
+ * Returns undefined when the provider omitted the field so callers can leave
+ * the key off entirely rather than fabricating a 0.
+ */
+const optionalToken = (value: unknown): number | undefined =>
+  value === undefined || value === null ? undefined : safeToken(value);
+
+const safeCost = (value: unknown): number | null => {
+  if (value === null || value === undefined) return null;
+  const num = Number(value);
+  if (!Number.isFinite(num) || num < 0) return null;
+  return num;
+};
+
+export interface ProviderCostDetails {
+  total_cost: number | null;
+  input_cost: number | null;
+  output_cost: number | null;
+  cached_input_cost: number | null;
+  cache_write_input_cost: number | null;
+  upstream_inference_cost: number | null;
+  upstream_inference_prompt_cost: number | null;
+  upstream_inference_completions_cost: number | null;
+  request_cost: number | null;
+  web_search_cost: number | null;
+  image_input_cost: number | null;
+  image_output_cost: number | null;
+  audio_input_cost: number | null;
+  data_storage_cost: number | null;
+}
+
+export interface UsageWithCostDetails extends UsageSubset {
+  provider_cost_details: ProviderCostDetails | null;
+}
+
+/**
+ * Extract provider-reported cost details from the usage.cost_details block.
+ * Some providers (e.g., openrouter-like proxies) include detailed cost
+ * breakdowns directly in the usage object.
+ */
+export function extractUsageCostDetails(usage: any): ProviderCostDetails | null {
+  const details = usage?.cost_details;
+
+  if (!details || typeof details !== 'object') {
+    // No cost_details block — check top-level cost fields from providers that omit cost_details:
+    // - usage.cost: OpenRouter-routed providers (e.g. Kimi/Avian) that don't surface cost_details
+    // - usage.cost_in_usd_ticks: xAI grok models; 1 USD = 10^10 ticks per xAI API docs.
+    const topLevelCost = safeCost(usage?.cost ?? usage?.estimated_cost);
+    const xaiTicks =
+      typeof usage?.cost_in_usd_ticks === 'number'
+        ? safeCost(usage.cost_in_usd_ticks / 10_000_000_000)
+        : null;
+    const totalCost = topLevelCost || xaiTicks;
+    if (totalCost === null) return null;
+
+    return {
+      total_cost: totalCost,
+      input_cost: null,
+      output_cost: null,
+      cached_input_cost: null,
+      cache_write_input_cost: null,
+      upstream_inference_cost: null,
+      upstream_inference_prompt_cost: null,
+      upstream_inference_completions_cost: null,
+      request_cost: null,
+      web_search_cost: null,
+      image_input_cost: null,
+      image_output_cost: null,
+      audio_input_cost: null,
+      data_storage_cost: null,
+    };
+  }
+
+  // Determine total cost:
+  // 1. cost_details.total_cost
+  // 2. usage.cost or usage.estimated_cost (standard path)
+  // 3. cost_details.upstream_inference_cost (OpenRouter quirk)
+  let totalCost = safeCost(details.total_cost);
+
+  const costFromUsage = safeCost(usage?.cost ?? usage?.estimated_cost);
+  const upstreamInferenceCost = safeCost(details.upstream_inference_cost);
+
+  if (totalCost === null) {
+    // || not ?? — BYOK keys report usage.cost=0 (ModelMux charges nothing), so a
+    // falsy 0 should fall through to upstreamInferenceCost which carries the
+    // actual provider cost.
+    totalCost = costFromUsage || upstreamInferenceCost;
+  }
+  if (totalCost === null) return null;
+
+  return {
+    total_cost: totalCost,
+    // upstream_inference_prompt_cost includes cached tokens (input_cost + cached_input_cost),
+    // so it can't be mapped directly to input_cost. The upstream fields are preserved
+    // here and dispatched separately in applyUsageCostDetails().
+    input_cost: safeCost(details.input_cost),
+    output_cost: safeCost(details.output_cost),
+    cached_input_cost: safeCost(details.cached_input_cost),
+    cache_write_input_cost: safeCost(details.cache_write_input_cost),
+    upstream_inference_cost: safeCost(details.upstream_inference_cost),
+    upstream_inference_prompt_cost: safeCost(
+      details.upstream_inference_prompt_cost ?? details.upstream_inference_input_cost
+    ),
+    upstream_inference_completions_cost: safeCost(
+      details.upstream_inference_completions_cost ?? details.upstream_inference_output_cost
+    ),
+    request_cost: safeCost(details.request_cost),
+    web_search_cost: safeCost(details.web_search_cost),
+    image_input_cost: safeCost(details.image_input_cost),
+    image_output_cost: safeCost(details.image_output_cost),
+    audio_input_cost: safeCost(details.audio_input_cost),
+    data_storage_cost: safeCost(details.data_storage_cost),
+  };
+}
+
+export function normalizeOpenAIChatUsage(usage: any): UsageSubset {
+  const promptTokens = safeToken(usage?.prompt_tokens);
+  const cachedTokens = safeToken(
+    usage?.prompt_tokens_details?.cached_tokens ??
+      usage?.cached_tokens ??
+      usage?.prompt_cache_hit_tokens
+  );
+  const cacheWriteTokens = safeToken(usage?.prompt_tokens_details?.cache_write_tokens);
+  const outputTokens = safeToken(usage?.completion_tokens);
+  const reasoningTokens = safeToken(usage?.completion_tokens_details?.reasoning_tokens);
+
+  // OpenAI chat prompt_tokens generally includes cached tokens, but guard for edge payloads.
+  const inputTokens =
+    cachedTokens > promptTokens ? promptTokens : Math.max(0, promptTokens - cachedTokens);
+
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: safeToken(usage?.total_tokens) || inputTokens + cachedTokens + outputTokens,
+    reasoning_tokens: reasoningTokens,
+    cached_tokens: cachedTokens,
+    cache_creation_tokens: cacheWriteTokens,
+  };
+}
+
+export function normalizeOpenAIResponsesUsage(usage: any): UsageSubset {
+  const reportedInputTokens = safeToken(usage?.input_tokens);
+  const cachedTokens = safeToken(usage?.input_tokens_details?.cached_tokens);
+  const cacheWriteTokens = safeToken(usage?.input_tokens_details?.cache_write_tokens);
+  const outputTokens = safeToken(usage?.output_tokens);
+  const reasoningTokens = safeToken(usage?.output_tokens_details?.reasoning_tokens);
+  // Present only when the built-in `image_generation` tool ran; kept optional
+  // so usage payloads rebuilt downstream stay unchanged for text-only turns.
+  const inputImageTokens = optionalToken(usage?.input_tokens_details?.image_tokens);
+  const outputImageTokens = optionalToken(usage?.output_tokens_details?.image_tokens);
+
+  // Responses API input_tokens includes cached reads and cache writes.
+  // Responses payloads may appear in two shapes depending on source:
+  // - total input tokens with cached/write included → subtract both
+  // - uncached input tokens with cached/write reported separately → keep as-is
+  const combinedNonNew = cachedTokens + cacheWriteTokens;
+  const inputTokens =
+    combinedNonNew > reportedInputTokens
+      ? reportedInputTokens
+      : Math.max(0, reportedInputTokens - combinedNonNew);
+
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens:
+      safeToken(usage?.total_tokens) ||
+      inputTokens + cachedTokens + cacheWriteTokens + outputTokens,
+    reasoning_tokens: reasoningTokens,
+    cached_tokens: cachedTokens,
+    cache_creation_tokens: cacheWriteTokens,
+    ...(inputImageTokens !== undefined ? { input_image_tokens: inputImageTokens } : {}),
+    ...(outputImageTokens !== undefined ? { output_image_tokens: outputImageTokens } : {}),
+  };
+}
+
+export function normalizeGeminiUsage(usageMetadata: any): UsageSubset {
+  const promptTokens = safeToken(usageMetadata?.promptTokenCount);
+  const cachedTokens = safeToken(usageMetadata?.cachedContentTokenCount);
+  const outputTokens = safeToken(usageMetadata?.candidatesTokenCount);
+  const reasoningTokens = safeToken(usageMetadata?.thoughtsTokenCount);
+  const toolUsePromptTokens = safeToken(usageMetadata?.toolUsePromptTokenCount);
+
+  // Vertex/Gemini promptTokenCount includes cached content when present.
+  const inputTokens =
+    cachedTokens > promptTokens ? promptTokens : Math.max(0, promptTokens - cachedTokens);
+
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens:
+      safeToken(usageMetadata?.totalTokenCount) ||
+      promptTokens + outputTokens + toolUsePromptTokens + reasoningTokens,
+    reasoning_tokens: reasoningTokens,
+    cached_tokens: cachedTokens,
+    cache_creation_tokens: 0,
+  };
+}
+
+export function normalizeAnthropicUsage(usage: any): UsageSubset {
+  const inputTokens = safeToken(usage?.input_tokens);
+  const cachedTokens = safeToken(usage?.cache_read_input_tokens);
+  const cacheCreationTokens = safeToken(usage?.cache_creation_input_tokens);
+  const outputTokens = safeToken(usage?.output_tokens);
+
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: inputTokens + cachedTokens + cacheCreationTokens + outputTokens,
+    reasoning_tokens: 0,
+    cached_tokens: cachedTokens,
+    cache_creation_tokens: cacheCreationTokens,
+  };
+}
+
+export function normalizeOAuthUsage(usage: any): UsageSubset {
+  const inputTokens = safeToken(usage?.input ?? usage?.input_tokens);
+  const outputTokens = safeToken(usage?.output ?? usage?.output_tokens);
+  const cachedTokens = safeToken(usage?.cacheRead ?? usage?.cached_tokens);
+  const cacheCreationTokens = safeToken(usage?.cacheWrite ?? usage?.cache_creation_tokens);
+
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens:
+      safeToken(usage?.totalTokens ?? usage?.total_tokens) ||
+      inputTokens + cachedTokens + cacheCreationTokens + outputTokens,
+    reasoning_tokens: safeToken(usage?.reasoning_tokens),
+    cached_tokens: cachedTokens,
+    cache_creation_tokens: cacheCreationTokens,
+  };
+}
