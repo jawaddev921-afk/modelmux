@@ -1,0 +1,939 @@
+import { beforeAll, describe, expect, it, mock, test } from 'bun:test';
+
+import Fastify, { FastifyInstance } from 'fastify';
+
+import { getConfig, setConfigForTesting } from '../../../config';
+import { Dispatcher } from '../../../services/dispatch/dispatcher';
+import { DebugManager } from '../../../services/observability/debug-manager';
+import { UsageStorageService } from '../../../services/observability/usage-storage';
+import { SelectorFactory } from '../../../services/routing/selectors/factory';
+import { registerInferenceRoutes } from '../index';
+
+describe('Auth Middleware', () => {
+  let fastify: FastifyInstance;
+  let mockUsageStorage: UsageStorageService;
+
+  beforeAll(async () => {
+    fastify = Fastify();
+
+    // Mock dependencies
+    const mockDispatcher = {
+      dispatch: mock(async () => ({
+        id: '123',
+        model: 'gpt-4',
+        created: 123,
+        content: 'test content',
+        usage: { input_tokens: 10, output_tokens: 10, total_tokens: 20 },
+      })),
+    } as unknown as Dispatcher;
+
+    mockUsageStorage = {
+      saveRequest: mock(),
+      saveError: mock(),
+      updatePerformanceMetrics: mock(),
+      emitStartedAsync: mock(),
+      emitUpdatedAsync: mock(),
+    } as unknown as UsageStorageService;
+    // Initialize singletons to avoid errors
+    DebugManager.getInstance().setStorage(mockUsageStorage);
+    SelectorFactory.setUsageStorage(mockUsageStorage);
+
+    // Set config with keys
+    setConfigForTesting({
+      providers: {},
+      models: {
+        'gpt-4': {
+          priority: 'selector',
+          sticky_session: false,
+          targets: [{ provider: 'openai', model: 'gpt-4' }],
+        },
+      },
+      keys: {
+        'test-key-1': { secret: 'sk-valid-key', comment: 'Test Key' },
+      },
+      failover: {
+        enabled: false,
+        retryableStatusCodes: [429, 500, 502, 503, 504],
+        retryableErrors: ['ECONNREFUSED', 'ETIMEDOUT'],
+      },
+      quotas: [],
+    });
+
+    await registerInferenceRoutes(fastify, mockDispatcher, mockUsageStorage);
+    await fastify.ready();
+  });
+
+  it('should allow request with valid Bearer token', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: 'Bearer sk-valid-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'gpt-4',
+        messages: [],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+
+    // Verify that usage tracking recorded the KEY NAME, not the secret
+    const saveRequestCalls = (mockUsageStorage.saveRequest as any).mock.calls;
+    const lastCall = saveRequestCalls[saveRequestCalls.length - 1];
+    expect(lastCall[0].apiKey).toBe('test-key-1');
+  });
+
+  it('persists and echoes a client request ID separately from the ModelMux request ID', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: 'Bearer sk-valid-key',
+        'content-type': 'application/json',
+        'x-client-request-id': 'client-request-123',
+      },
+      payload: {
+        model: 'gpt-4',
+        messages: [],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['x-client-request-id']).toBe('client-request-123');
+    expect(response.headers['x-request-id']).not.toBe('client-request-123');
+
+    const saveRequestCalls = (mockUsageStorage.saveRequest as any).mock.calls;
+    const lastCall = saveRequestCalls[saveRequestCalls.length - 1];
+    expect(lastCall[0].clientRequestId).toBe('client-request-123');
+  });
+
+  it('should allow request with x-api-key header', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/messages', // Anthropic style
+      headers: {
+        'x-api-key': 'sk-valid-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'gpt-4',
+        messages: [],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('should allow request with x-goog-api-key header', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        'x-goog-api-key': 'sk-valid-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'gpt-4',
+        messages: [],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('should allow Gemini request with key query parameter', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1beta/models/gpt-4:generateContent',
+      query: {
+        key: 'sk-valid-key',
+      },
+      headers: {
+        'content-type': 'application/json',
+      },
+      payload: {
+        contents: [],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('should reject Gemini request with missing key', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1beta/models/gpt-4:generateContent',
+      headers: {
+        'content-type': 'application/json',
+      },
+      payload: {
+        contents: [],
+      },
+    });
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('should reject request with invalid key', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: 'Bearer invalid-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'gpt-4',
+        messages: [],
+      },
+    });
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('should reject a disabled key', async () => {
+    const config = getConfig();
+    setConfigForTesting({
+      ...config,
+      keys: {
+        ...config.keys,
+        'disabled-key': { secret: 'sk-disabled-key', disabledAt: Date.now() },
+      },
+    });
+
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: 'Bearer sk-disabled-key',
+        'content-type': 'application/json',
+      },
+      payload: { model: 'gpt-4', messages: [] },
+    });
+
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('should reject request with missing key', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'gpt-4',
+        messages: [],
+      },
+    });
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('should allow public access to /v1/models', async () => {
+    const response = await fastify.inject({
+      method: 'GET',
+      url: '/v1/models',
+    });
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('requires auth and returns Muse metadata derived from the configured model', async () => {
+    const config = getConfig();
+    setConfigForTesting({
+      ...config,
+      models: {
+        'muse-spark-1.3': {
+          priority: 'selector',
+          sticky_session: false,
+          targets: [],
+          metadata: {
+            source: 'custom',
+            overrides: {
+              name: 'Muse Spark 1.3',
+              context_length: 1_007_997,
+              architecture: {
+                input_modalities: ['text', 'image'],
+                output_modalities: ['text'],
+              },
+              pricing: {
+                prompt: '0.000002',
+                completion: '0.000008',
+              },
+              supported_parameters: ['tools', 'reasoning'],
+              top_provider: {
+                max_completion_tokens: 128_000,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    for (const url of ['/v1/muse-code/models', '/muse-code/models']) {
+      const unauthorized = await fastify.inject({ method: 'GET', url });
+      expect(unauthorized.statusCode).toBe(401);
+    }
+
+    const response = await fastify.inject({
+      method: 'GET',
+      url: '/v1/muse-code/models',
+      headers: { authorization: 'Bearer sk-valid-key' },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('application/json');
+    expect(response.json()).toEqual({
+      object: 'list',
+      data: [
+        expect.objectContaining({
+          id: 'muse-spark-1.3',
+          object: 'model',
+          owned_by: 'meta',
+          created: expect.any(Number),
+          metadata: {
+            'muse-code': expect.objectContaining({
+              name: 'muse-spark-1.3',
+              attachment: true,
+              reasoning: true,
+              temperature: false,
+              tool_call: true,
+              modalities: { input: ['text', 'image'], output: ['text'] },
+              limit: { context: 1_007_997, output: 128_000 },
+              cost: {
+                currency: 'USD',
+                input: '0.000002',
+                output: '0.000008',
+                cached: '0.000002',
+              },
+            }),
+          },
+        }),
+      ],
+    });
+
+    const aliasResponse = await fastify.inject({
+      method: 'GET',
+      url: '/muse-code/models',
+      headers: { authorization: 'Bearer sk-valid-key' },
+    });
+    expect(aliasResponse.statusCode).toBe(200);
+    expect(aliasResponse.json()).toEqual(response.json());
+  });
+});
+
+describe('Key Attribution', () => {
+  let fastify: FastifyInstance;
+  let mockUsageStorage: UsageStorageService;
+
+  beforeAll(async () => {
+    fastify = Fastify();
+
+    // Mock dependencies
+    const mockDispatcher = {
+      dispatch: mock(async () => ({
+        id: '123',
+        model: 'gpt-4',
+        created: 123,
+        content: 'test content',
+        usage: { input_tokens: 10, output_tokens: 10, total_tokens: 20 },
+      })),
+    } as unknown as Dispatcher;
+
+    mockUsageStorage = {
+      saveRequest: mock(),
+      saveError: mock(),
+      updatePerformanceMetrics: mock(),
+      emitStartedAsync: mock(),
+      emitUpdatedAsync: mock(),
+    } as unknown as UsageStorageService;
+
+    // Initialize singletons
+    DebugManager.getInstance().setStorage(mockUsageStorage);
+    SelectorFactory.setUsageStorage(mockUsageStorage);
+
+    // Set config with keys
+    setConfigForTesting({
+      providers: {},
+      models: {
+        'gpt-4': {
+          priority: 'selector',
+          sticky_session: false,
+          targets: [{ provider: 'openai', model: 'gpt-4' }],
+        },
+      },
+      keys: {
+        'test-key-1': { secret: 'sk-valid-key', comment: 'Test Key' },
+      },
+      failover: {
+        enabled: false,
+        retryableStatusCodes: [429, 500, 502, 503, 504],
+        retryableErrors: ['ECONNREFUSED', 'ETIMEDOUT'],
+      },
+      quotas: [],
+    });
+
+    await registerInferenceRoutes(fastify, mockDispatcher, mockUsageStorage);
+    await fastify.ready();
+  });
+
+  it('should parse key with attribution and track it', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: 'Bearer sk-valid-key:copilot',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'gpt-4',
+        messages: [],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const saveRequestCalls = (mockUsageStorage.saveRequest as any).mock.calls;
+    const lastCall = saveRequestCalls[saveRequestCalls.length - 1];
+    expect(lastCall[0].apiKey).toBe('test-key-1');
+    expect(lastCall[0].attribution).toBe('copilot');
+  });
+
+  it('should normalize attribution to lowercase', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: 'Bearer sk-valid-key:CoPilot',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'gpt-4',
+        messages: [],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const saveRequestCalls = (mockUsageStorage.saveRequest as any).mock.calls;
+    const lastCall = saveRequestCalls[saveRequestCalls.length - 1];
+    expect(lastCall[0].attribution).toBe('copilot');
+  });
+
+  it('should support attribution with multiple colons', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: 'Bearer sk-valid-key:copilot:dev:v1',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'gpt-4',
+        messages: [],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const saveRequestCalls = (mockUsageStorage.saveRequest as any).mock.calls;
+    const lastCall = saveRequestCalls[saveRequestCalls.length - 1];
+    expect(lastCall[0].attribution).toBe('copilot:dev:v1');
+  });
+
+  it('should set attribution to null when not provided', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: 'Bearer sk-valid-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'gpt-4',
+        messages: [],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const saveRequestCalls = (mockUsageStorage.saveRequest as any).mock.calls;
+    const lastCall = saveRequestCalls[saveRequestCalls.length - 1];
+    expect(lastCall[0].attribution).toBe(null);
+  });
+
+  it('should authenticate different attributions with same secret', async () => {
+    // First request with attribution "copilot"
+    const response1 = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: 'Bearer sk-valid-key:copilot',
+        'content-type': 'application/json',
+      },
+      payload: { model: 'gpt-4', messages: [] },
+    });
+    expect(response1.statusCode).toBe(200);
+
+    // Second request with attribution "claude"
+    const response2 = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: 'Bearer sk-valid-key:claude',
+        'content-type': 'application/json',
+      },
+      payload: { model: 'gpt-4', messages: [] },
+    });
+    expect(response2.statusCode).toBe(200);
+
+    // Both should authenticate as the same key but with different attributions
+    const calls = (mockUsageStorage.saveRequest as any).mock.calls;
+    const call1 = calls[calls.length - 2];
+    const call2 = calls[calls.length - 1];
+
+    expect(call1[0].apiKey).toBe('test-key-1');
+    expect(call1[0].attribution).toBe('copilot');
+
+    expect(call2[0].apiKey).toBe('test-key-1');
+    expect(call2[0].attribution).toBe('claude');
+  });
+
+  it('should reject invalid secret even with attribution', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: 'Bearer invalid-key:copilot',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'gpt-4',
+        messages: [],
+      },
+    });
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('should parse attribution from x-api-key header', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/messages',
+      headers: {
+        'x-api-key': 'sk-valid-key:anthropic',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'gpt-4',
+        messages: [],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const saveRequestCalls = (mockUsageStorage.saveRequest as any).mock.calls;
+    const lastCall = saveRequestCalls[saveRequestCalls.length - 1];
+    expect(lastCall[0].attribution).toBe('anthropic');
+  });
+
+  it('should parse attribution from query parameter', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1beta/models/gpt-4:generateContent',
+      query: {
+        key: 'sk-valid-key:gemini',
+      },
+      headers: {
+        'content-type': 'application/json',
+      },
+      payload: {
+        contents: [],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const saveRequestCalls = (mockUsageStorage.saveRequest as any).mock.calls;
+    const lastCall = saveRequestCalls[saveRequestCalls.length - 1];
+    expect(lastCall[0].attribution).toBe('gemini');
+  });
+});
+
+describe('Key Access Policy Propagation', () => {
+  let fastify: FastifyInstance;
+  let mockUsageStorage: UsageStorageService;
+  let capturedRequest: any;
+
+  beforeAll(async () => {
+    fastify = Fastify();
+    capturedRequest = null;
+
+    const mockDispatcher = {
+      dispatch: mock(async (request: any) => {
+        capturedRequest = request;
+        return {
+          id: '123',
+          model: 'gpt-4',
+          created: 123,
+          content: 'test content',
+          usage: { input_tokens: 10, output_tokens: 10, total_tokens: 20 },
+        };
+      }),
+    } as unknown as Dispatcher;
+
+    mockUsageStorage = {
+      saveRequest: mock(),
+      saveError: mock(),
+      updatePerformanceMetrics: mock(),
+      emitStartedAsync: mock(),
+      emitUpdatedAsync: mock(),
+    } as unknown as UsageStorageService;
+
+    DebugManager.getInstance().setStorage(mockUsageStorage);
+    SelectorFactory.setUsageStorage(mockUsageStorage);
+
+    setConfigForTesting({
+      providers: {},
+      models: {
+        'gpt-4': {
+          priority: 'selector',
+          sticky_session: false,
+          targets: [{ provider: 'openai', model: 'gpt-4' }],
+        },
+      },
+      keys: {
+        restricted: {
+          secret: 'sk-restricted-key',
+          allowedModels: ['gpt-4', 'gpt-4-mini'],
+          allowedProviders: ['openai', 'azure-openai'],
+        },
+      },
+      failover: {
+        enabled: false,
+        retryableStatusCodes: [429, 500, 502, 503, 504],
+        retryableErrors: ['ECONNREFUSED', 'ETIMEDOUT'],
+      },
+      quotas: [],
+    });
+
+    await registerInferenceRoutes(fastify, mockDispatcher, mockUsageStorage);
+    await fastify.ready();
+  });
+
+  it('attaches key access policy metadata to unified requests', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: 'Bearer sk-restricted-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'gpt-4',
+        messages: [],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(capturedRequest?.metadata?.modelmux_metadata?.modelmux_key_policy).toEqual({
+      allowedModels: ['gpt-4', 'gpt-4-mini'],
+      allowedProviders: ['openai', 'azure-openai'],
+    });
+  });
+
+  it('attaches key access policy metadata on messages requests', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/messages',
+      headers: {
+        'x-api-key': 'sk-restricted-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'gpt-4',
+        max_tokens: 16,
+        messages: [
+          {
+            role: 'user',
+            content: 'hello',
+          },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(capturedRequest?.metadata?.modelmux_metadata?.modelmux_key_policy).toEqual({
+      allowedModels: ['gpt-4', 'gpt-4-mini'],
+      allowedProviders: ['openai', 'azure-openai'],
+    });
+  });
+});
+
+describe('Key Access Policy Exclusion Propagation', () => {
+  let fastify: FastifyInstance;
+  let mockUsageStorage: UsageStorageService;
+  let capturedRequest: any;
+
+  beforeAll(async () => {
+    fastify = Fastify();
+    capturedRequest = null;
+
+    const mockDispatcher = {
+      dispatch: mock(async (request: any) => {
+        capturedRequest = request;
+        return {
+          id: '123',
+          model: 'gpt-4',
+          created: 123,
+          content: 'test content',
+          usage: { input_tokens: 10, output_tokens: 10, total_tokens: 20 },
+        };
+      }),
+    } as unknown as Dispatcher;
+
+    mockUsageStorage = {
+      saveRequest: mock(),
+      saveError: mock(),
+      updatePerformanceMetrics: mock(),
+      emitStartedAsync: mock(),
+      emitUpdatedAsync: mock(),
+    } as unknown as UsageStorageService;
+
+    DebugManager.getInstance().setStorage(mockUsageStorage);
+    SelectorFactory.setUsageStorage(mockUsageStorage);
+
+    setConfigForTesting({
+      providers: {},
+      models: {
+        'gpt-4': {
+          priority: 'selector',
+          sticky_session: false,
+          targets: [{ provider: 'openai', model: 'gpt-4' }],
+        },
+      },
+      keys: {
+        excluded: {
+          secret: 'sk-excluded-key',
+          excludedModels: ['claude-3-opus', 'gpt-5'],
+          excludedProviders: ['azure-openai', 'google'],
+        },
+      },
+      failover: {
+        enabled: false,
+        retryableStatusCodes: [429, 500, 502, 503, 504],
+        retryableErrors: ['ECONNREFUSED', 'ETIMEDOUT'],
+      },
+      quotas: [],
+    });
+
+    await registerInferenceRoutes(fastify, mockDispatcher, mockUsageStorage);
+    await fastify.ready();
+  });
+
+  it('attaches excluded models and providers policy metadata', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: 'Bearer sk-excluded-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'gpt-4',
+        messages: [],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(capturedRequest?.metadata?.modelmux_metadata?.modelmux_key_policy).toEqual({
+      excludedModels: ['claude-3-opus', 'gpt-5'],
+      excludedProviders: ['azure-openai', 'google'],
+    });
+  });
+});
+
+describe('Key IP Allowlist', () => {
+  let fastify: FastifyInstance;
+  let mockUsageStorage: UsageStorageService;
+
+  beforeAll(async () => {
+    fastify = Fastify();
+
+    const mockDispatcher = {
+      dispatch: mock(async () => ({
+        id: '123',
+        model: 'gpt-4',
+        created: 123,
+        content: 'test content',
+        usage: { input_tokens: 10, output_tokens: 10, total_tokens: 20 },
+      })),
+    } as unknown as Dispatcher;
+
+    mockUsageStorage = {
+      saveRequest: mock(),
+      saveError: mock(),
+      updatePerformanceMetrics: mock(),
+      emitStartedAsync: mock(),
+      emitUpdatedAsync: mock(),
+    } as unknown as UsageStorageService;
+
+    DebugManager.getInstance().setStorage(mockUsageStorage);
+    SelectorFactory.setUsageStorage(mockUsageStorage);
+
+    setConfigForTesting({
+      providers: {},
+      models: {
+        'gpt-4': {
+          priority: 'selector',
+          sticky_session: false,
+          targets: [{ provider: 'openai', model: 'gpt-4' }],
+        },
+      },
+      keys: {
+        'ip-restricted': { secret: 'sk-ip-restricted', allowedIps: ['10.0.0.0/8'] },
+        'ip-open': { secret: 'sk-ip-open', allowedIps: ['0.0.0.0/0'] },
+        'ip-none': { secret: 'sk-ip-none' },
+      },
+      failover: {
+        enabled: false,
+        retryableStatusCodes: [429, 500, 502, 503, 504],
+        retryableErrors: ['ECONNREFUSED', 'ETIMEDOUT'],
+      },
+      quotas: [],
+    });
+
+    await registerInferenceRoutes(fastify, mockDispatcher, mockUsageStorage);
+    await fastify.ready();
+  });
+
+  const post = (secret: string, forwardedFor?: string) =>
+    fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: `Bearer ${secret}`,
+        'content-type': 'application/json',
+        ...(forwardedFor ? { 'x-forwarded-for': forwardedFor } : {}),
+      },
+      payload: { model: 'gpt-4', messages: [] },
+    });
+
+  it('allows a request from an IP inside the allowlist', async () => {
+    const res = await post('sk-ip-restricted', '10.1.2.3');
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('rejects a request from an IP outside the allowlist', async () => {
+    const res = await post('sk-ip-restricted', '8.8.8.8');
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('allows any IP when the allowlist is 0.0.0.0/0', async () => {
+    const res = await post('sk-ip-open', '8.8.8.8');
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('allows any IP when no allowlist is configured', async () => {
+    const res = await post('sk-ip-none', '8.8.8.8');
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('rejects a restricted key when the request IP is not in range (no forwarding header)', async () => {
+    // Without a proxy header the resolved IP is loopback (or null), neither of
+    // which is in 10.0.0.0/8 — restricted keys are denied (fail-closed).
+    const res = await post('sk-ip-restricted');
+    expect(res.statusCode).toBe(401);
+  });
+});
+
+describe('Trusted Proxy Header Handling', () => {
+  let fastify: FastifyInstance;
+  let mockUsageStorage: UsageStorageService;
+
+  // Reconfigure the global config (the auth hook reads it per request) with a
+  // key locked to 10.0.0.0/8 and a given trusted-proxy list.
+  const configure = (trustedProxies?: string[]) =>
+    setConfigForTesting({
+      providers: {},
+      models: {
+        'gpt-4': {
+          priority: 'selector',
+          sticky_session: false,
+          targets: [{ provider: 'openai', model: 'gpt-4' }],
+        },
+      },
+      keys: {
+        'ip-restricted': { secret: 'sk-ip-restricted', allowedIps: ['10.0.0.0/8'] },
+      },
+      failover: {
+        enabled: false,
+        retryableStatusCodes: [429, 500, 502, 503, 504],
+        retryableErrors: ['ECONNREFUSED', 'ETIMEDOUT'],
+      },
+      quotas: [],
+      ...(trustedProxies !== undefined ? { trustedProxies } : {}),
+    });
+
+  beforeAll(async () => {
+    fastify = Fastify();
+
+    const mockDispatcher = {
+      dispatch: mock(async () => ({
+        id: '123',
+        model: 'gpt-4',
+        created: 123,
+        content: 'test content',
+        usage: { input_tokens: 10, output_tokens: 10, total_tokens: 20 },
+      })),
+    } as unknown as Dispatcher;
+
+    mockUsageStorage = {
+      saveRequest: mock(),
+      saveError: mock(),
+      updatePerformanceMetrics: mock(),
+      emitStartedAsync: mock(),
+      emitUpdatedAsync: mock(),
+    } as unknown as UsageStorageService;
+
+    DebugManager.getInstance().setStorage(mockUsageStorage);
+    SelectorFactory.setUsageStorage(mockUsageStorage);
+
+    configure(['0.0.0.0/0']);
+    await registerInferenceRoutes(fastify, mockDispatcher, mockUsageStorage);
+    await fastify.ready();
+  });
+
+  // fastify.inject connects over loopback, so request.ip is 127.0.0.1.
+  const inject = (forwardedFor: string) =>
+    fastify.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        authorization: 'Bearer sk-ip-restricted',
+        'content-type': 'application/json',
+        'x-forwarded-for': forwardedFor,
+      },
+      payload: { model: 'gpt-4', messages: [] },
+    });
+
+  it('honors X-Forwarded-For when all proxies are trusted (0.0.0.0/0)', async () => {
+    configure(['0.0.0.0/0']);
+    const res = await inject('10.1.2.3');
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('ignores a spoofed X-Forwarded-For when no proxies are trusted', async () => {
+    configure([]);
+    // The loopback peer is used instead of the spoofed 10.1.2.3, so the key's
+    // 10.0.0.0/8 allowlist rejects the request.
+    const res = await inject('10.1.2.3');
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('honors X-Forwarded-For when the peer matches a trusted proxy', async () => {
+    configure(['127.0.0.0/8']);
+    const res = await inject('10.1.2.3');
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('ignores a spoofed prepended X-Forwarded-For entry (walks right-to-left)', async () => {
+    configure(['127.0.0.0/8']); // loopback peer is a trusted proxy
+    // Attacker prepends an allowed IP; the trusted proxy appended the real client.
+    const res = await inject('10.0.0.5, 8.8.8.8');
+    expect(res.statusCode).toBe(401); // real client 8.8.8.8 is not in 10.0.0.0/8
+  });
+
+  it('resolves the right-most real client behind a trusted proxy', async () => {
+    configure(['127.0.0.0/8']);
+    const res = await inject('8.8.8.8, 10.0.0.5'); // real client 10.0.0.5 is allowed
+    expect(res.statusCode).toBe(200);
+  });
+});
