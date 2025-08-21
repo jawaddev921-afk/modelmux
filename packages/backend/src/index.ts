@@ -1,0 +1,521 @@
+// Check for subcommands (e.g. `./modelmux rekey`) before starting the server.
+// This allows Docker users to run CLI tools without needing the source code.
+const subcommand = process.argv[2];
+if (subcommand === 'rekey') {
+  const { rekeyMain } = await import('./cli/rekey');
+  rekeyMain()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error('Re-key failed:', err);
+      process.exit(1);
+    });
+  // Prevent the rest of the server from initializing
+  await new Promise(() => {}); // Block forever; process.exit above will terminate
+}
+
+if (subcommand === 'backup') {
+  const { backupMain } = await import('./cli/backup');
+  backupMain()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error('Backup failed:', err);
+      process.exit(1);
+    });
+  await new Promise(() => {});
+}
+
+import fs from 'fs';
+import path from 'path';
+
+import { registerBunOAuthFlows } from '@earendil-works/pi-ai/bun-oauth';
+import cors from '@fastify/cors';
+import multipart from '@fastify/multipart';
+import Fastify, { FastifyReply, FastifyRequest } from 'fastify';
+
+import indexHtmlPath from '../../frontend/dist/index.html' with { type: 'file' };
+import mainJsPath from '../../frontend/dist/main.js' with { type: 'file' };
+import { getConfig } from './config';
+import { initializeDatabase } from './db/client';
+import { runEncryptionMigration } from './db/encrypt-migration';
+import { runMcpKeyMigration } from './db/mcp-key-migration';
+import { runMigrations } from './db/migrate';
+import { requestLogger } from './middleware/log';
+import { registerInferenceRoutes } from './routes/inference';
+import { registerManagementRoutes } from './routes/management';
+import { registerMcpRoutes } from './routes/mcp';
+import { registerOpenApiRoute } from './routes/openapi';
+import { registerRawPassthroughRoutes } from './routes/raw-passthrough';
+import { ConfigService } from './services/configuration/config-service';
+import { Dispatcher } from './services/dispatch/dispatcher';
+import { mcpProcessManager } from './services/mcp-local/mcp-process-manager';
+import { McpUsageStorageService } from './services/mcp-proxy/mcp-usage-storage';
+import { ModelMetadataManager } from './services/models/model-metadata-manager';
+import { ClaudeCodeVersionService } from './services/oauth/claude-code-version-service';
+import { CodexVersionService } from './services/oauth/codex-version-service';
+import { OAuthAuthManager } from './services/oauth/oauth-auth-manager';
+import { DebugManager } from './services/observability/debug-manager';
+import { UsageStorageService } from './services/observability/usage-storage';
+import { initModelCatalog } from './services/pi-ai/catalog';
+import { ProbeService } from './services/probes/probe-service';
+import { QuotaEnforcer } from './services/quota/quota-enforcer';
+import { QuotaScheduler } from './services/quota/quota-scheduler';
+import { ResponsesStorageService } from './services/responses/responses-storage';
+import { BackgroundExplorer } from './services/routing/background-explorer';
+import { SelectorFactory } from './services/routing/selectors/factory';
+import { CooldownManager } from './services/runtime/cooldown-manager';
+import { isEncryptionEnabled } from './utils/encryption';
+import { closeFetchSessions } from './utils/fetch-sessions';
+import { logger } from './utils/logger';
+
+// @ts-expect-error — CSS import with type:'file' resolved at build time
+import mainCssPath from '../../frontend/dist/main.css' with { type: 'file' };
+
+registerBunOAuthFlows();
+
+/**
+ * ModelMux Backend Server
+ *
+ * Powered by Fastify and Bun.
+ * This server acts as a unified gateway for various LLM providers,
+ * handling request transformation, load balancing, and usage tracking.
+ */
+
+// --- Required Environment Variables ---
+if (!process.env.ADMIN_KEY) {
+  logger.error(
+    'ADMIN_KEY environment variable is required. Set it to a secure password for admin access.'
+  );
+  process.exit(1);
+}
+
+if (!process.env.DATABASE_URL) {
+  const dataDir = process.env.DATA_DIR || '/app/data';
+  process.env.DATABASE_URL = `sqlite://${dataDir}/modelmux.db`;
+}
+
+// Log startup configuration
+logger.debug(`DATABASE_URL: ${process.env.DATABASE_URL}`);
+logger.debug(`PORT: ${process.env.PORT || '4000'}`);
+
+const fastify = Fastify({
+  logger: false, // We use a custom winston-based logger
+  bodyLimit: 30 * 1024 * 1024, // 30MB to accommodate 25MB audio files + metadata
+  forceCloseConnections: true, // Destroy all open sockets on shutdown (fixes SSE hang)
+});
+
+// --- Plugin Registration ---
+
+// Enable CORS for all origins to support dashboard and external client access
+fastify.register(cors, {
+  origin: '*',
+  methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'x-api-key',
+    'x-admin-key',
+    'x-goog-api-key',
+    'x-client-request-id',
+  ],
+  exposedHeaders: [
+    'Content-Type',
+    'x-request-id',
+    'x-client-request-id',
+    'x-modelmux-request-id',
+    'x-modelmux-quota',
+    'x-modelmux-quota-limit',
+    'x-modelmux-quota-remaining',
+    'x-modelmux-quota-reset',
+    'x-modelmux-quota-warning',
+  ],
+});
+
+// Enable multipart/form-data support for file uploads (audio transcriptions)
+fastify.register(multipart, {
+  limits: {
+    fileSize: 25 * 1024 * 1024, // 25MB limit (OpenAI's limit)
+  },
+  attachFieldsToBody: true, // Makes form fields accessible via request.body
+});
+
+// --- Service Initialization ---
+
+const dispatcher = new Dispatcher();
+const usageStorage = new UsageStorageService();
+const mcpUsageStorage = new McpUsageStorageService();
+const quotaScheduler = QuotaScheduler.getInstance();
+
+// Initialize singletons with storage dependencies
+dispatcher.setUsageStorage(usageStorage);
+DebugManager.getInstance().setStorage(usageStorage);
+SelectorFactory.setUsageStorage(usageStorage);
+SelectorFactory.setQuotaScheduler(quotaScheduler);
+
+// ProbeService is shared between the management test endpoint and the
+// background explorer. BackgroundExplorer is created here so router
+// triggers can pick it up via getInstance() once routes start handling
+// traffic.
+const probeService = new ProbeService(dispatcher, usageStorage);
+BackgroundExplorer.initialize(probeService);
+
+// Enable debug mode if DEBUG=true environment variable is set
+if (process.env.DEBUG === 'true') {
+  DebugManager.getInstance().setEnabled(true);
+  logger.warn('Debug mode auto-enabled via DEBUG=true environment variable');
+}
+
+// --- Database Initialization ---
+// Database must be initialized BEFORE config loading (config is now DB-backed)
+try {
+  initializeDatabase();
+  await runMigrations();
+  await runEncryptionMigration();
+  await runMcpKeyMigration();
+} catch (e) {
+  logger.error('Failed to initialize database or run migrations', e);
+  process.exit(1);
+}
+
+if (!isEncryptionEnabled()) {
+  logger.warn(
+    'ENCRYPTION_KEY not set — sensitive data will be stored in plaintext. Set ENCRYPTION_KEY for encryption at rest.'
+  );
+}
+
+// --- Model Catalog Initialization ---
+// Restore the persisted pi.dev catalog overlay (offline, fast) so config
+// validation and dispatch see models released between pi-ai versions, then
+// refresh from pi.dev in the background. Non-fatal: the static built-in
+// catalog is the fallback.
+try {
+  await initModelCatalog();
+} catch (e) {
+  logger.error('Failed to initialize model catalog', e);
+}
+
+// --- Configuration Initialization ---
+try {
+  const configService = ConfigService.getInstance();
+
+  await configService.initialize();
+  logger.debug('Configuration loaded from database');
+
+  // Restore the persisted "capture trace on error" toggle into DebugManager.
+  DebugManager.getInstance().setCaptureOnError(
+    await configService.getRepository().getCaptureTraceOnError()
+  );
+
+  // One-time migration of legacy flat-format aliases to target groups.
+  // TODO(#target-groups-cleanup): remove this after migration period.
+  await configService.migrateLegacyTargetGroups();
+
+  // One-time migration: rewrite legacy model_type 'chat'/'responses' → 'text'.
+  await configService.migrateModelTypes();
+
+  // One-time repair: null out model_alias_targets.target_alias_slug rows
+  // corrupted by the alias-as-fallback-target table-recreation migration
+  // (the literal column-name string was written under SQLite DQS). Idempotent;
+  // no-op on clean/corrected databases.
+  await configService.repairCorruptedAliasFallbackSlugs();
+
+  // One-time cleanup: drop any persisted Gemini CLI / Antigravity OAuth
+  // providers + credentials (those providers were removed).
+  await configService.dropRetiredOAuthProviders();
+
+  // Eagerly initialize OAuth auth manager so auth.json schema migration
+  // runs during startup (instead of waiting for first OAuth request).
+  await OAuthAuthManager.getInstance().initialize();
+  // Load model metadata from all configured sources (non-fatal on failure)
+  const modelMetadataManager = ModelMetadataManager.getInstance();
+  modelMetadataManager.startAutoRefresh(60);
+  modelMetadataManager.refreshAll(undefined, 'startup').catch((e) => {
+    logger.error('Failed to load model metadata', e);
+  });
+  const codexVersionService = CodexVersionService.getInstance();
+  codexVersionService.startAutoRefresh(60);
+  codexVersionService.fetchVersion().catch((e) => {
+    logger.error('Failed to fetch codex version', e);
+  });
+  const claudeCodeVersionService = ClaudeCodeVersionService.getInstance();
+  claudeCodeVersionService.startAutoRefresh(60);
+  claudeCodeVersionService.fetchVersion().catch((e) => {
+    logger.error('Failed to fetch claude-code version', e);
+  });
+} catch (e) {
+  logger.error('Failed to load config', e);
+  process.exit(1);
+}
+
+// Load cooldowns from storage (requires DB to be ready)
+try {
+  await CooldownManager.getInstance().loadFromStorage();
+} catch (e) {
+  logger.error('Failed to load cooldowns from storage', e);
+}
+
+// Initialize quota checkers (requires DB to be ready)
+try {
+  const config = getConfig();
+  await quotaScheduler.initialize(config.quotas ?? []);
+} catch (e) {
+  logger.error('Failed to initialize quota checkers', e);
+}
+
+// Initialize user quota enforcer (requires DB to be ready)
+let quotaEnforcer: QuotaEnforcer | undefined;
+try {
+  quotaEnforcer = new QuotaEnforcer();
+  logger.debug('User quota enforcer initialized');
+} catch (e) {
+  logger.error('Failed to initialize user quota enforcer', e);
+}
+
+// --- Hooks & Global Logic ---
+
+// Global Unhandled Rejection Handler
+// Prevents application crashes from unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Promise Rejection', { reason, promise });
+});
+
+// Global Uncaught Exception Handler
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception', error);
+});
+
+// Global Request Logger: Runs on every incoming request
+fastify.addHook('onRequest', requestLogger);
+
+/**
+ * Global Error Handler
+ * Normalizes errors into a consistent JSON format compatible with AI API standards.
+ * Prevents double-sending responses by checking reply.sent.
+ */
+fastify.setErrorHandler((error, request, reply) => {
+  if (reply.sent) {
+    logger.error('Error occurred after response was sent', error);
+    return;
+  }
+
+  logger.error('Unhandled Fastify Error', error);
+
+  if (error instanceof Error && 'validation' in error) {
+    return reply.code(400).send({
+      error: {
+        message: 'Validation Error',
+        details: (error as any).validation,
+      },
+    });
+  }
+
+  const err = error as any;
+
+  // Oversized bodies (Fastify bodyLimit) are reported the way clients expect
+  // for context overflow, so they compact and retry instead of failing.
+  if (err.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
+    return reply.code(413).send({
+      error: {
+        message:
+          'Your input exceeds the context window of this model. Please adjust your input and try again.',
+        type: 'invalid_request_error',
+        code: 'context_length_exceeded',
+      },
+    });
+  }
+
+  reply.code(err.statusCode || 500).send({
+    error: {
+      message: err.message || 'Internal Server Error',
+      type: 'api_error',
+    },
+  });
+});
+
+// --- Routes: v1 (Inference API) ---
+await registerInferenceRoutes(fastify, dispatcher, usageStorage, quotaEnforcer);
+
+// --- Raw Provider Proxy ---
+await registerRawPassthroughRoutes(fastify, usageStorage, quotaEnforcer);
+
+// --- Routes: MCP Proxy ---
+await registerMcpRoutes(fastify, mcpUsageStorage);
+
+// Public discovery document for API clients.
+await registerOpenApiRoute(fastify);
+
+// --- Response Storage Cleanup ---
+// Start cleanup job (runs every hour, deletes responses older than 7 days)
+const responsesStorage = new ResponsesStorageService();
+responsesStorage.startCleanupJob(1, 7);
+
+// --- Observability Retention ---
+// Prune request usage, debug, error, and MCP logs older than
+// MODELMUX_USAGE_RETENTION_DAYS (default 365 days) once a day.
+usageStorage.startCleanupJob();
+mcpUsageStorage.startCleanupJob();
+
+// --- Management API (v0) ---
+await registerManagementRoutes(
+  fastify,
+  usageStorage,
+  dispatcher,
+  probeService,
+  quotaScheduler,
+  mcpUsageStorage,
+  quotaEnforcer
+);
+
+// Health check endpoint for container orchestration.
+// `version` lets the frontend detect a new deploy and reload itself
+// instead of sitting on a stale bundle. APP_VERSION is baked in at
+// Docker build time (release tag, dev sha, or staging timestamp).
+fastify.get('/health', (request, reply) => reply.send('OK'));
+fastify.get('/healthz', (request, reply) =>
+  reply.send({ ok: true, version: process.env.APP_VERSION || 'dev' })
+);
+
+// --- Static File Serving ---
+// `indexHtmlPath` is a string path — the filesystem path in dev, or a $bunfs/ path in a
+// compiled binary. Bun embeds index.html and all assets it references (JS, CSS, images, SVGs)
+// automatically when compiled. `Bun.file()` resolves both path forms transparently.
+
+const mimeTypes: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.ico': 'image/x-icon',
+  '.svg': 'image/svg+xml',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.webmanifest': 'application/manifest+json',
+};
+
+// Map of known frontend assets to their embedded paths.
+// These are explicitly referenced here so Bun's bundler does not tree-shake
+// the `with { type: 'file' }` imports away during --compile.
+const frontendDistDir = path.dirname(indexHtmlPath as unknown as string);
+const indexHtmlStr = indexHtmlPath as unknown as string;
+const mainJsStr = mainJsPath as unknown as string;
+const mainCssStr = mainCssPath as unknown as string;
+const frontendAssetPaths: Record<string, string> = {
+  'index.html': indexHtmlStr,
+  'main.js': mainJsStr,
+  'main.css': mainCssStr,
+};
+
+// For any other assets in the dist dir (favicons, images, etc.), fall back to
+// Bun.embeddedFiles (populated from CLI args with --asset-naming="[name].[ext]")
+// or the filesystem path in dev mode.
+type EmbeddedFile = Blob & { name: string };
+const embeddedByName = new Map<string, EmbeddedFile>(
+  (Bun.embeddedFiles as EmbeddedFile[]).map((f) => [f.name, f])
+);
+
+logger.debug(`Serving frontend from: ${frontendDistDir}`);
+
+const serveAsset = async (reply: FastifyReply, filePath: string, ext: string) => {
+  const mimeType = mimeTypes[ext] ?? 'application/octet-stream';
+  return reply
+    .header('Cache-Control', 'no-store')
+    .type(mimeType)
+    .send(Buffer.from(await Bun.file(filePath).arrayBuffer()));
+};
+
+fastify.get('/ui/', async (request, reply) => serveAsset(reply, indexHtmlStr, '.html'));
+fastify.get('/ui/index.html', async (request, reply) => serveAsset(reply, indexHtmlStr, '.html'));
+fastify.get('/ui/:filename', async (request, reply) => {
+  const { filename } = request.params as { filename: string };
+  const ext = path.extname(filename);
+  // SPA routes like /ui/logs should resolve to the frontend shell.
+  if (!ext) {
+    return serveAsset(reply, indexHtmlStr, '.html');
+  }
+  // Known asset with an explicit embedded path
+  const knownPath = frontendAssetPaths[filename];
+  if (knownPath) return serveAsset(reply, knownPath, ext);
+  // Asset embedded via CLI args (favicons, images, SVGs, etc.)
+  const embedded = embeddedByName.get(filename);
+  if (embedded) {
+    const mimeType = mimeTypes[ext] ?? 'application/octet-stream';
+    return reply
+      .header('Cache-Control', 'no-store')
+      .type(mimeType)
+      .send(Buffer.from(await embedded.arrayBuffer()));
+  }
+  // Dev mode: serve from the dist directory on disk
+  const fsPath = path.join(frontendDistDir, filename);
+  const fsFile = Bun.file(fsPath);
+  if (await fsFile.exists()) return serveAsset(reply, fsPath, ext);
+  return reply.code(404).send('Not Found');
+});
+
+// Root Redirect to UI
+fastify.get('/', (request, reply) => {
+  reply.redirect('/ui/');
+});
+
+fastify.get('/ui', (request, reply) => {
+  reply.redirect('/ui/');
+});
+
+// Single Page Application (SPA) Fallback
+// Redirects all non-API routes to index.html so React Router can take over
+fastify.setNotFoundHandler(async (request, reply) => {
+  if (request.url.startsWith('/v1') || request.url.startsWith('/v0')) {
+    reply.code(404).send({ error: 'Not Found' });
+  } else if (request.url.startsWith('/ui/') || request.url === '/ui') {
+    return serveAsset(reply, indexHtmlStr, '.html');
+  } else {
+    reply.code(404).send({ error: 'Not Found' });
+  }
+});
+
+const port = parseInt(process.env.PORT || '4000');
+const host = process.env.HOST || '0.0.0.0';
+
+/**
+ * start
+ * Asynchronously starts the Fastify server.
+ */
+const start = async () => {
+  try {
+    await fastify.listen({ port, host });
+    logger.info(`Server listening on http://localhost:${port}`);
+
+    const shutdown = async (signal: string) => {
+      logger.info(`Received ${signal}, shutting down gracefully...`);
+      await quotaScheduler.stop();
+      await usageStorage.stopCleanupJob();
+      await mcpUsageStorage.stopCleanupJob();
+      await responsesStorage.stopCleanupJob();
+      await mcpProcessManager.stopAll();
+      await fastify.close();
+      // After the server has drained: in-flight streams may still be reading
+      // from session sockets, so sessions close last.
+      closeFetchSessions();
+      const { closeDatabase } = await import('./db/client');
+      await closeDatabase();
+      logger.info('Shutdown complete');
+      process.exit(0);
+    };
+
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+  } catch (err) {
+    logger.error('Fatal error during server startup', err);
+    process.exit(1);
+  }
+};
+
+// Only start the server if this file is being executed directly by Bun
+if (import.meta.main) {
+  start();
+}
+
+export default {
+  port,
+  server: fastify,
+};
