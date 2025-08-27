@@ -1,0 +1,339 @@
+import { afterEach, beforeEach, describe, expect, it, mock, test } from 'bun:test';
+
+import Fastify, { FastifyInstance } from 'fastify';
+
+import { setConfigForTesting } from '../../../config';
+import { Dispatcher } from '../../../services/dispatch/dispatcher';
+import { DebugManager } from '../../../services/observability/debug-manager';
+import { UsageStorageService } from '../../../services/observability/usage-storage';
+import { SelectorFactory } from '../../../services/routing/selectors/factory';
+import { registerInferenceRoutes } from '../index';
+
+const EMBEDDINGS_TEST_CONFIG = {
+  providers: {
+    openai: {
+      api_key: 'sk-test',
+      api_base_url: 'https://api.openai.com/v1',
+      estimateTokens: false,
+      disable_cooldown: false,
+      stall_cooldown: false,
+      allow_100_percent_utilization: false,
+      useClaudeMasking: false,
+      models: {
+        'text-embedding-3-small': {
+          pricing: { source: 'simple' as const, input: 0.00002, output: 0 },
+        },
+      },
+    },
+  },
+  models: {
+    'embeddings-small': {
+      priority: 'selector' as const,
+      sticky_session: false,
+      targets: [{ provider: 'openai', model: 'text-embedding-3-small' }],
+    },
+  },
+  keys: {
+    'test-key-1': { secret: 'sk-valid-key', comment: 'Test Key' },
+  },
+  failover: {
+    enabled: false,
+    retryableStatusCodes: [429, 500, 502, 503, 504],
+    retryableErrors: ['ECONNREFUSED', 'ETIMEDOUT'],
+  },
+  quotas: [],
+};
+
+describe('Embeddings Endpoint', () => {
+  let fastify: FastifyInstance;
+  let mockUsageStorage: UsageStorageService;
+  let mockDispatcher: Dispatcher;
+
+  beforeEach(async () => {
+    // Set config first so it's available when routes register
+    setConfigForTesting(EMBEDDINGS_TEST_CONFIG);
+
+    fastify = Fastify();
+
+    mockDispatcher = {
+      dispatch: mock(async () => ({
+        id: '123',
+        model: 'gpt-4',
+        created: 123,
+        content: 'test content',
+        usage: {
+          input_tokens: 10,
+          output_tokens: 10,
+          total_tokens: 20,
+          reasoning_tokens: 0,
+          cached_tokens: 0,
+          cache_creation_tokens: 0,
+        },
+      })),
+      dispatchEmbeddings: mock(async () => ({
+        object: 'list',
+        data: [
+          {
+            object: 'embedding',
+            embedding: [0.1, 0.2, 0.3, -0.1, -0.2],
+            index: 0,
+          },
+        ],
+        model: 'text-embedding-3-small',
+        usage: {
+          prompt_tokens: 8,
+          total_tokens: 8,
+        },
+        modelmux: {
+          provider: 'openai',
+          model: 'text-embedding-3-small',
+          apiType: 'embeddings',
+          canonicalModel: 'embeddings-small',
+        },
+      })),
+    } as unknown as Dispatcher;
+
+    mockUsageStorage = {
+      saveRequest: mock(),
+      saveError: mock(),
+      saveDebugLog: mock(),
+      updatePerformanceMetrics: mock(),
+      emitStartedAsync: mock(),
+      emitUpdatedAsync: mock(),
+    } as unknown as UsageStorageService;
+
+    DebugManager.getInstance().setStorage(mockUsageStorage);
+    SelectorFactory.setUsageStorage(mockUsageStorage);
+
+    await registerInferenceRoutes(fastify, mockDispatcher, mockUsageStorage);
+    await fastify.ready();
+  });
+
+  afterEach(async () => {
+    await fastify.close();
+  });
+
+  it('should accept embeddings request with single text input', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/embeddings',
+      headers: {
+        authorization: 'Bearer sk-valid-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'embeddings-small',
+        input: 'The quick brown fox jumps over the lazy dog',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.object).toBe('list');
+    expect(Array.isArray(body.data)).toBe(true);
+    expect(body.data[0].object).toBe('embedding');
+    expect(Array.isArray(body.data[0].embedding)).toBe(true);
+    expect(body.model).toBe('text-embedding-3-small');
+    expect(body.usage).toBeDefined();
+    expect(body.usage.prompt_tokens).toBe(8);
+  });
+
+  it('should accept embeddings request with array input', async () => {
+    (mockDispatcher.dispatchEmbeddings as any).mockImplementationOnce(async () => ({
+      object: 'list',
+      data: [
+        { object: 'embedding', embedding: [0.1, 0.2], index: 0 },
+        { object: 'embedding', embedding: [0.3, 0.4], index: 1 },
+        { object: 'embedding', embedding: [0.5, 0.6], index: 2 },
+      ],
+      model: 'text-embedding-3-small',
+      usage: { prompt_tokens: 24, total_tokens: 24 },
+      modelmux: {
+        provider: 'openai',
+        model: 'text-embedding-3-small',
+        apiType: 'embeddings',
+      },
+    }));
+
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/embeddings',
+      headers: {
+        authorization: 'Bearer sk-valid-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'embeddings-small',
+        input: ['Text 1', 'Text 2', 'Text 3'],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.data).toHaveLength(3);
+    expect(body.data[0].index).toBe(0);
+    expect(body.data[1].index).toBe(1);
+    expect(body.data[2].index).toBe(2);
+  });
+
+  it('should accept optional encoding_format parameter', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/embeddings',
+      headers: {
+        authorization: 'Bearer sk-valid-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'embeddings-small',
+        input: 'Test text',
+        encoding_format: 'float',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('should accept optional dimensions parameter', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/embeddings',
+      headers: {
+        authorization: 'Bearer sk-valid-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'embeddings-small',
+        input: 'Test text',
+        dimensions: 256,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('should track usage correctly for embeddings', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/embeddings',
+      headers: {
+        authorization: 'Bearer sk-valid-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'embeddings-small',
+        input: 'Test input',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const saveRequestCalls = (mockUsageStorage.saveRequest as any).mock.calls;
+    const lastCall = saveRequestCalls[saveRequestCalls.length - 1];
+
+    expect(lastCall[0].incomingApiType).toBe('embeddings');
+    expect(lastCall[0].tokensInput).toBe(8);
+    expect(lastCall[0].tokensOutput).toBe(0); // Embeddings have no output tokens
+    expect(lastCall[0].responseStatus).toBe('success');
+    expect(lastCall[0].apiKey).toBe('test-key-1');
+  });
+
+  it('should require authentication', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/embeddings',
+      headers: {
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'embeddings-small',
+        input: 'Test text',
+      },
+    });
+
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('should reject invalid API key', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/embeddings',
+      headers: {
+        authorization: 'Bearer invalid-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'embeddings-small',
+        input: 'Test text',
+      },
+    });
+
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('should support x-api-key header', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/embeddings',
+      headers: {
+        'x-api-key': 'sk-valid-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'embeddings-small',
+        input: 'Test text',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('should track attribution when provided', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/embeddings',
+      headers: {
+        authorization: 'Bearer sk-valid-key:my-app',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'embeddings-small',
+        input: 'Test text',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const saveRequestCalls = (mockUsageStorage.saveRequest as any).mock.calls;
+    const lastCall = saveRequestCalls[saveRequestCalls.length - 1];
+    expect(lastCall[0].attribution).toBe('my-app');
+  });
+
+  it('should handle dispatcher errors gracefully', async () => {
+    (mockDispatcher.dispatchEmbeddings as any).mockRejectedValueOnce(
+      new Error('Provider unavailable')
+    );
+
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/v1/embeddings',
+      headers: {
+        authorization: 'Bearer sk-valid-key',
+        'content-type': 'application/json',
+      },
+      payload: {
+        model: 'embeddings-small',
+        input: 'Test text',
+      },
+    });
+
+    expect(response.statusCode).toBe(500);
+    const body = JSON.parse(response.body);
+    expect(body.error).toBeDefined();
+    expect(body.error.message).toContain('Provider unavailable');
+
+    // Verify error was logged
+    const saveErrorCalls = (mockUsageStorage.saveError as any).mock.calls;
+    expect(saveErrorCalls.length).toBeGreaterThan(0);
+  });
+});

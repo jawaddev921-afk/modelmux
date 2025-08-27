@@ -1,0 +1,135 @@
+import { FastifyInstance } from 'fastify';
+
+import { Dispatcher } from '../../services/dispatch/dispatcher';
+import { DebugManager } from '../../services/observability/debug-manager';
+import { UsageStorageService } from '../../services/observability/usage-storage';
+import { OpenAIEmbeddingsTransformer } from '../../transformers/embeddings';
+import { UnifiedEmbeddingsRequest } from '../../types/unified';
+import { UsageRecord } from '../../types/usage';
+import { attachKeyAccessPolicy } from '../../utils/auth';
+import { calculateCosts } from '../../utils/calculate-costs';
+import { CLIENT_REQUEST_ID_HEADER, getClientRequestId } from '../../utils/client-request-id';
+import { getClientIp } from '../../utils/ip';
+import { logger } from '../../utils/logger';
+import { sanitizeHeaders } from '../../utils/sanitize-headers';
+
+export async function registerEmbeddingsRoute(
+  fastify: FastifyInstance,
+  dispatcher: Dispatcher,
+  usageStorage: UsageStorageService
+) {
+  /**
+   * POST /v1/embeddings
+   * OpenAI Compatible Embeddings Endpoint.
+   * Supports any provider that implements the OpenAI embeddings API format.
+   */
+  fastify.post('/v1/embeddings', async (request, reply) => {
+    const requestId = crypto.randomUUID();
+    const clientRequestId = getClientRequestId(request.headers);
+    reply.header('x-request-id', requestId);
+    if (clientRequestId) reply.header(CLIENT_REQUEST_ID_HEADER, clientRequestId);
+    const startTime = Date.now();
+
+    let usageRecord: Partial<UsageRecord> = {
+      requestId,
+      clientRequestId,
+      date: new Date().toISOString(),
+      sourceIp: getClientIp(request),
+      incomingApiType: 'embeddings',
+      startTime,
+      isStreamed: false,
+      responseStatus: 'pending',
+    };
+
+    // Emit 'started' event immediately - this allows frontend to show in-flight requests
+    usageStorage.emitStartedAsync(usageRecord);
+
+    try {
+      const body = request.body as any;
+      usageRecord.incomingModelAlias = body.model;
+      usageRecord.apiKey = (request as any).keyName;
+      usageRecord.attribution = (request as any).attribution || null;
+
+      // Emit 'updated' event with parsed request details
+      usageStorage.emitUpdatedAsync({
+        requestId,
+        incomingModelAlias: body.model,
+        apiKey: (request as any).keyName,
+        attribution: (request as any).attribution || null,
+      });
+
+      logger.silly('Incoming Embeddings Request', body);
+
+      const transformer = new OpenAIEmbeddingsTransformer();
+      let unifiedRequest: UnifiedEmbeddingsRequest = {
+        model: body.model,
+        input: body.input,
+        encoding_format: body.encoding_format,
+        dimensions: body.dimensions,
+        user: body.user,
+        incomingApiType: 'embeddings',
+        originalBody: body,
+        requestId,
+      };
+      unifiedRequest = attachKeyAccessPolicy(request, unifiedRequest);
+
+      DebugManager.getInstance().startLog(requestId, body, sanitizeHeaders(request.headers as any));
+
+      const unifiedResponse = await dispatcher.dispatchEmbeddings(unifiedRequest);
+
+      // Emit 'updated' event with routing decision details
+      usageStorage.emitUpdatedAsync({
+        requestId,
+        provider: unifiedResponse.modelmux?.provider,
+        selectedModelName: unifiedResponse.modelmux?.model,
+        canonicalModelName: unifiedResponse.modelmux?.canonicalModel,
+      });
+
+      // Record usage
+      usageRecord.provider = unifiedResponse.modelmux?.provider;
+      usageRecord.selectedModelName = unifiedResponse.modelmux?.model;
+      usageRecord.canonicalModelName = unifiedResponse.modelmux?.canonicalModel;
+      usageRecord.outgoingApiType = unifiedResponse.modelmux?.apiType;
+      usageRecord.attemptCount = unifiedResponse.modelmux?.attemptCount ?? 1;
+      usageRecord.retryHistory = unifiedResponse.modelmux?.retryHistory ?? null;
+      usageRecord.isPassthrough = true; // Embeddings are always pass-through (OpenAI format)
+      usageRecord.tokensInput = unifiedResponse.usage?.prompt_tokens ?? 0;
+      usageRecord.tokensOutput = 0; // Embeddings don't have output tokens
+      usageRecord.durationMs = Date.now() - startTime;
+      usageRecord.responseStatus = 'success';
+
+      // Calculate cost using existing utility
+      const pricing = unifiedResponse.modelmux?.pricing;
+      const providerDiscount = unifiedResponse.modelmux?.providerDiscount;
+      calculateCosts(usageRecord, pricing, providerDiscount);
+
+      usageStorage.saveRequest(usageRecord as UsageRecord);
+
+      const formattedResponse = await transformer.formatResponse(unifiedResponse);
+
+      DebugManager.getInstance().addTransformedResponse(requestId, formattedResponse);
+      DebugManager.getInstance().flush(requestId);
+
+      return reply.send(formattedResponse);
+    } catch (e: any) {
+      usageRecord.responseStatus = 'error';
+      usageRecord.durationMs = Date.now() - startTime;
+      usageRecord.attemptCount = e.routingContext?.attemptCount || usageRecord.attemptCount || 1;
+      usageRecord.retryHistory = e.routingContext?.retryHistory || usageRecord.retryHistory || null;
+      usageStorage.saveRequest(usageRecord as UsageRecord);
+
+      const errorDetails = {
+        apiType: 'embeddings',
+        ...(e.routingContext || {}),
+      };
+
+      usageStorage.saveError(requestId, e, errorDetails);
+      DebugManager.getInstance().flush(requestId);
+      logger.error('Error processing embeddings request', e);
+
+      return reply.code(e.routingContext?.statusCode || 500).send({
+        error: { message: e.message, type: 'api_error' },
+      });
+    }
+  });
+}
