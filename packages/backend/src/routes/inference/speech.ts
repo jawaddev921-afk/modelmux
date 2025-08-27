@@ -1,0 +1,168 @@
+import { FastifyInstance } from 'fastify';
+
+import { Dispatcher } from '../../services/dispatch/dispatcher';
+import { DebugManager } from '../../services/observability/debug-manager';
+import { UsageStorageService } from '../../services/observability/usage-storage';
+import { SpeechTransformer } from '../../transformers';
+import { UnifiedSpeechRequest } from '../../types/unified';
+import { UsageRecord } from '../../types/usage';
+import { attachKeyAccessPolicy } from '../../utils/auth';
+import { calculateCosts } from '../../utils/calculate-costs';
+import { CLIENT_REQUEST_ID_HEADER, getClientRequestId } from '../../utils/client-request-id';
+import { getClientIp } from '../../utils/ip';
+import { logger } from '../../utils/logger';
+import { sanitizeHeaders } from '../../utils/sanitize-headers';
+
+const VALID_VOICES = [
+  'alloy',
+  'ash',
+  'ballad',
+  'coral',
+  'echo',
+  'fable',
+  'onyx',
+  'nova',
+  'sage',
+  'shimmer',
+  'verse',
+  'marin',
+  'cedar',
+];
+const VALID_FORMATS = ['mp3', 'opus', 'aac', 'flac', 'wav', 'pcm'];
+const VALID_STREAM_FORMATS = ['sse', 'audio'];
+
+export async function registerSpeechRoute(
+  fastify: FastifyInstance,
+  dispatcher: Dispatcher,
+  usageStorage: UsageStorageService
+) {
+  /**
+   * POST /v1/audio/speech
+   * OpenAI Compatible Text-to-Speech Endpoint.
+   * Accepts JSON body with text, voice, and model parameters.
+   */
+  fastify.post('/v1/audio/speech', async (request, reply) => {
+    const requestId = crypto.randomUUID();
+    const clientRequestId = getClientRequestId(request.headers);
+    reply.header('x-request-id', requestId);
+    if (clientRequestId) reply.header(CLIENT_REQUEST_ID_HEADER, clientRequestId);
+    const startTime = Date.now();
+
+    let usageRecord: Partial<UsageRecord> = {
+      requestId,
+      clientRequestId,
+      date: new Date().toISOString(),
+      sourceIp: getClientIp(request),
+      incomingApiType: 'speech',
+      startTime,
+      isStreamed: false,
+      responseStatus: 'pending',
+    };
+
+    // Emit 'started' event immediately - this allows frontend to show in-flight requests
+    usageStorage.emitStartedAsync(usageRecord);
+
+    try {
+      const body = request.body as any;
+
+      usageRecord.incomingModelAlias = body.model;
+      usageRecord.apiKey = (request as any).keyName;
+      usageRecord.attribution = (request as any).attribution || null;
+
+      // Emit 'updated' event with parsed request details
+      usageStorage.emitUpdatedAsync({
+        requestId,
+        incomingModelAlias: body.model,
+        apiKey: (request as any).keyName,
+        attribution: (request as any).attribution || null,
+      });
+
+      logger.silly('Incoming Speech Request', body);
+
+      const transformer = new SpeechTransformer();
+
+      let unifiedRequest: UnifiedSpeechRequest = {
+        model: body.model,
+        input: body.input,
+        voice: body.voice,
+        instructions: body.instructions,
+        response_format: body.response_format,
+        speed: body.speed,
+        stream_format: body.stream_format,
+        requestId,
+        incomingApiType: 'speech',
+        originalBody: body,
+      };
+      unifiedRequest = attachKeyAccessPolicy(request, unifiedRequest);
+
+      DebugManager.getInstance().startLog(
+        requestId,
+        {
+          ...body,
+          inputLength: body.input?.length || 0,
+        },
+        sanitizeHeaders(request.headers as any)
+      );
+
+      const unifiedResponse = await dispatcher.dispatchSpeech(unifiedRequest);
+
+      // Emit 'updated' event with routing decision details
+      usageStorage.emitUpdatedAsync({
+        requestId,
+        provider: unifiedResponse.modelmux?.provider,
+        selectedModelName: unifiedResponse.modelmux?.model,
+        canonicalModelName: unifiedResponse.modelmux?.canonicalModel,
+      });
+
+      usageRecord.provider = unifiedResponse.modelmux?.provider;
+      usageRecord.selectedModelName = unifiedResponse.modelmux?.model;
+      usageRecord.canonicalModelName = unifiedResponse.modelmux?.canonicalModel;
+      usageRecord.outgoingApiType = unifiedResponse.modelmux?.apiType;
+      usageRecord.isPassthrough = true;
+      usageRecord.isStreamed = !!unifiedResponse.stream;
+      usageRecord.durationMs = Date.now() - startTime;
+      usageRecord.responseStatus = 'success';
+
+      const pricing = unifiedResponse.modelmux?.pricing;
+      const providerDiscount = unifiedResponse.modelmux?.providerDiscount;
+      calculateCosts(usageRecord, pricing, providerDiscount);
+
+      usageStorage.saveRequest(usageRecord as UsageRecord);
+
+      DebugManager.getInstance().addTransformedResponse(requestId, {
+        size: unifiedResponse.audio?.length || 0,
+        isStreamed: unifiedResponse.isStreamed,
+      });
+      DebugManager.getInstance().flush(requestId);
+
+      const mimeType = transformer.getMimeType(unifiedRequest.response_format);
+      reply.type(mimeType);
+
+      if (unifiedResponse.stream) {
+        usageRecord.isStreamed = true;
+        return reply.send(unifiedResponse.stream);
+      }
+
+      return reply.send(unifiedResponse.audio);
+    } catch (e: any) {
+      usageRecord.responseStatus = 'error';
+      usageRecord.durationMs = Date.now() - startTime;
+      usageRecord.attemptCount = e.routingContext?.attemptCount || usageRecord.attemptCount || 1;
+      usageRecord.retryHistory = e.routingContext?.retryHistory || usageRecord.retryHistory || null;
+      usageStorage.saveRequest(usageRecord as UsageRecord);
+
+      const errorDetails = {
+        apiType: 'speech',
+        ...(e.routingContext || {}),
+      };
+
+      usageStorage.saveError(requestId, e, errorDetails);
+      DebugManager.getInstance().flush(requestId);
+      logger.error('Error processing speech request', e);
+
+      return reply.code(e.routingContext?.statusCode || 500).send({
+        error: { message: e.message, type: 'api_error' },
+      });
+    }
+  });
+}
