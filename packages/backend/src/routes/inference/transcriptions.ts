@@ -1,0 +1,222 @@
+import { FastifyInstance } from 'fastify';
+
+import { Dispatcher } from '../../services/dispatch/dispatcher';
+import { DebugManager } from '../../services/observability/debug-manager';
+import { UsageStorageService } from '../../services/observability/usage-storage';
+import { TranscriptionsTransformer } from '../../transformers';
+import { UnifiedTranscriptionRequest } from '../../types/unified';
+import { UsageRecord } from '../../types/usage';
+import { attachKeyAccessPolicy } from '../../utils/auth';
+import { calculateCosts } from '../../utils/calculate-costs';
+import { CLIENT_REQUEST_ID_HEADER, getClientRequestId } from '../../utils/client-request-id';
+import { getClientIp } from '../../utils/ip';
+import { logger } from '../../utils/logger';
+import { sanitizeHeaders } from '../../utils/sanitize-headers';
+
+export async function registerTranscriptionsRoute(
+  fastify: FastifyInstance,
+  dispatcher: Dispatcher,
+  usageStorage: UsageStorageService
+) {
+  /**
+   * POST /v1/audio/transcriptions
+   * OpenAI Compatible Audio Transcriptions Endpoint.
+   * Accepts multipart/form-data with audio file and transcription parameters.
+   */
+  fastify.post('/v1/audio/transcriptions', async (request, reply) => {
+    const requestId = crypto.randomUUID();
+    const clientRequestId = getClientRequestId(request.headers);
+    reply.header('x-request-id', requestId);
+    if (clientRequestId) reply.header(CLIENT_REQUEST_ID_HEADER, clientRequestId);
+    const startTime = Date.now();
+
+    let usageRecord: Partial<UsageRecord> = {
+      requestId,
+      clientRequestId,
+      date: new Date().toISOString(),
+      sourceIp: getClientIp(request),
+      incomingApiType: 'transcriptions',
+      startTime,
+      isStreamed: false,
+      responseStatus: 'pending',
+    };
+
+    // Emit 'started' event immediately - this allows frontend to show in-flight requests
+    usageStorage.emitStartedAsync(usageRecord);
+
+    try {
+      // Extract form fields from request.body
+      // @fastify/multipart with attachFieldsToBody puts form fields and file in request.body
+      const body = request.body as any;
+
+      // Get file data from body.file
+      const fileData = body.file;
+      if (!fileData) {
+        return reply.code(400).send({
+          error: { message: 'No file uploaded', type: 'invalid_request_error' },
+        });
+      }
+
+      // Validate file size (25MB limit)
+      const fileSize = fileData.file?.bytesRead || 0;
+      if (fileSize > 25 * 1024 * 1024) {
+        return reply.code(400).send({
+          error: { message: 'File size exceeds 25MB limit', type: 'invalid_request_error' },
+        });
+      }
+
+      // Validate MIME type
+      const validMimeTypes = [
+        'audio/flac',
+        'audio/mpeg',
+        'audio/mp4',
+        'audio/mpeg',
+        'audio/mpga',
+        'audio/m4a',
+        'audio/ogg',
+        'audio/wav',
+        'audio/webm',
+        'audio/x-wav',
+        'audio/x-m4a',
+      ];
+
+      if (fileData.mimetype && !validMimeTypes.includes(fileData.mimetype)) {
+        logger.warn(`Unsupported MIME type: ${fileData.mimetype}, proceeding anyway`);
+      }
+
+      // Read file buffer
+      const fileBuffer = await fileData.toBuffer();
+
+      // Extract model (required)
+      const model = body.model?.value;
+      if (!model) {
+        return reply.code(400).send({
+          error: { message: 'Missing required parameter: model', type: 'invalid_request_error' },
+        });
+      }
+
+      // Extract optional fields
+      const language = body.language?.value;
+      const prompt = body.prompt?.value;
+      const response_format = body.response_format?.value || 'json';
+      const temperature = body.temperature?.value ? parseFloat(body.temperature.value) : undefined;
+
+      // Validate response_format
+      if (!['json', 'text', 'verbose_json'].includes(response_format)) {
+        return reply.code(400).send({
+          error: {
+            message: `Unsupported response_format: ${response_format}. Supported formats: json, text, verbose_json`,
+            type: 'invalid_request_error',
+          },
+        });
+      }
+
+      // Build unified request
+      const transformer = new TranscriptionsTransformer();
+      let unifiedRequest: UnifiedTranscriptionRequest = {
+        file: fileBuffer,
+        filename: fileData.filename,
+        mimeType: fileData.mimetype,
+        model,
+        language,
+        prompt,
+        response_format,
+        temperature,
+        requestId,
+        incomingApiType: 'transcriptions',
+      };
+      unifiedRequest = attachKeyAccessPolicy(request, unifiedRequest);
+
+      usageRecord.incomingModelAlias = model;
+      usageRecord.apiKey = (request as any).keyName;
+      usageRecord.attribution = (request as any).attribution || null;
+
+      // Emit 'updated' event with parsed request details
+      usageStorage.emitUpdatedAsync({
+        requestId,
+        incomingModelAlias: model,
+        apiKey: (request as any).keyName,
+        attribution: (request as any).attribution || null,
+      });
+
+      DebugManager.getInstance().startLog(
+        requestId,
+        {
+          model,
+          filename: fileData.filename,
+          fileSize,
+          mimeType: fileData.mimetype,
+          language,
+          prompt,
+          response_format,
+          temperature,
+        },
+        sanitizeHeaders(request.headers as any)
+      );
+
+      // Dispatch
+      const unifiedResponse = await dispatcher.dispatchTranscription(unifiedRequest);
+
+      // Emit 'updated' event with routing decision details
+      usageStorage.emitUpdatedAsync({
+        requestId,
+        provider: unifiedResponse.modelmux?.provider,
+        selectedModelName: unifiedResponse.modelmux?.model,
+        canonicalModelName: unifiedResponse.modelmux?.canonicalModel,
+      });
+
+      // Record usage
+      usageRecord.provider = unifiedResponse.modelmux?.provider;
+      usageRecord.selectedModelName = unifiedResponse.modelmux?.model;
+      usageRecord.canonicalModelName = unifiedResponse.modelmux?.canonicalModel;
+      usageRecord.outgoingApiType = unifiedResponse.modelmux?.apiType;
+      usageRecord.isPassthrough = true; // Transcriptions are pass-through (OpenAI format)
+      usageRecord.tokensInput = unifiedResponse.usage?.input_tokens || 0;
+      usageRecord.tokensOutput = unifiedResponse.usage?.output_tokens || 0;
+      usageRecord.durationMs = Date.now() - startTime;
+      usageRecord.responseStatus = 'success';
+
+      // Calculate costs
+      const pricing = unifiedResponse.modelmux?.pricing;
+      const providerDiscount = unifiedResponse.modelmux?.providerDiscount;
+      calculateCosts(usageRecord, pricing, providerDiscount);
+      usageRecord.attemptCount = unifiedResponse.modelmux?.attemptCount || 1;
+      usageRecord.retryHistory = unifiedResponse.modelmux?.retryHistory || null;
+
+      usageStorage.saveRequest(usageRecord as UsageRecord);
+
+      const formattedResponse = await transformer.formatResponse(unifiedResponse, response_format);
+
+      DebugManager.getInstance().addTransformedResponse(requestId, formattedResponse);
+      DebugManager.getInstance().flush(requestId);
+
+      // Set appropriate content type
+      if (response_format === 'text') {
+        reply.type('text/plain');
+      } else {
+        reply.type('application/json');
+      }
+
+      return reply.send(formattedResponse);
+    } catch (e: any) {
+      usageRecord.responseStatus = 'error';
+      usageRecord.durationMs = Date.now() - startTime;
+      usageRecord.attemptCount = e.routingContext?.attemptCount || usageRecord.attemptCount || 1;
+      usageRecord.retryHistory = e.routingContext?.retryHistory || usageRecord.retryHistory || null;
+      usageStorage.saveRequest(usageRecord as UsageRecord);
+
+      const errorDetails = {
+        apiType: 'transcriptions',
+        ...(e.routingContext || {}),
+      };
+
+      usageStorage.saveError(requestId, e, errorDetails);
+      DebugManager.getInstance().flush(requestId);
+      logger.error('Error processing transcription request', e);
+
+      return reply.code(e.routingContext?.statusCode || 500).send({
+        error: { message: e.message, type: 'api_error' },
+      });
+    }
+  });
+}
