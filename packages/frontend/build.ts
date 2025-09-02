@@ -1,0 +1,155 @@
+import { spawn } from 'child_process';
+import { existsSync, watch } from 'fs';
+import { cp, mkdir, readFile, writeFile } from 'fs/promises';
+
+import { build } from 'bun';
+
+const buildCSS = async () => {
+  console.log('Building CSS...');
+  const proc = spawn(
+    process.execPath,
+    ['x', '--bun', 'tailwindcss', '-i', './src/globals.css', '-o', './dist/main.css'],
+    {
+      stdio: 'inherit',
+      cwd: '.',
+    }
+  );
+
+  return new Promise<void>((resolve, reject) => {
+    proc.on('error', (error) => {
+      console.error('CSS Build failed.');
+      reject(error);
+    });
+
+    proc.on('close', (code) => {
+      if (code === 0) {
+        console.log('CSS Build complete.');
+        resolve();
+      } else {
+        console.error('CSS Build failed.');
+        reject(new Error(`CSS build exited with code ${code}`));
+      }
+    });
+  });
+};
+
+const copyAssets = async () => {
+  console.log('Copying assets...');
+  try {
+    if (existsSync('./src/assets')) {
+      await cp('./src/assets', './dist', { recursive: true });
+      console.log('Assets copied.');
+    } else {
+      console.warn('No assets directory found at ./src/assets');
+    }
+  } catch (e) {
+    console.error('Failed to copy assets:', e);
+  }
+};
+
+const runBuild = async () => {
+  console.log('Building...');
+
+  if (!existsSync('./dist')) {
+    await mkdir('./dist');
+  }
+
+  try {
+    await buildCSS();
+    await copyAssets();
+  } catch (e) {
+    console.error(e);
+  }
+
+  const result = await build({
+    entrypoints: ['./src/main.tsx'],
+    outdir: './dist',
+    // index.html loads main.js as a classic script. Keep bundle-local symbols
+    // scoped so dependency identifiers (for example a parser named `Element`)
+    // cannot overwrite browser globals used by Monaco and DOMPurify.
+    format: 'iife',
+    publicPath: '/ui/',
+    minify: process.env.NODE_ENV === 'production',
+    reactCompiler: true,
+    define: {
+      'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'development'),
+      'process.env.APP_VERSION': JSON.stringify(process.env.APP_VERSION || 'dev'),
+    },
+  });
+
+  if (!result.success) {
+    console.error('Build failed');
+    for (const log of result.logs) {
+      console.error(log);
+    }
+    return;
+  }
+
+  // HTML Injection
+  let html = await readFile('index.html', 'utf-8');
+  html = html.replace('src="./src/main.tsx"', 'src="main.js"');
+  html = html.replace('src="/src/main.tsx"', 'src="main.js"'); // Handle both absolute/relative
+  html = html.replace('type="module"', '');
+
+  // Inject Favicons and Manifest. SVG comes first so modern browsers prefer
+  // the new ModelMux geometric mark; older browsers fall back to the PNGs.
+  // (SVG is named modelmux-icon.svg rather than favicon.svg to avoid an
+  // output-collision with favicon.ico / favicon-*.png in --compile bundling.)
+  const faviconHtml = `
+    <link rel="icon" type="image/svg+xml" href="modelmux-icon.svg">
+    <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png">
+    <link rel="manifest" href="site.webmanifest">
+    `;
+
+  if (!html.includes('rel="manifest"')) {
+    html = html.replace('</head>', `${faviconHtml}\n  </head>`);
+  }
+
+  if (existsSync('dist/main.css')) {
+    // Check if link already exists to avoid dupes
+    if (!html.includes('href="main.css"')) {
+      html = html.replace('</head>', '  <link rel="stylesheet" href="main.css">\n  </head>');
+    }
+  }
+
+  await writeFile('dist/index.html', html);
+  console.log('Build complete.');
+};
+
+// Initial Build
+await runBuild();
+
+// Watch Mode
+if (process.argv.includes('--watch')) {
+  console.log('Watching for changes in ./src ...');
+
+  let debounceTimer: Timer | null = null;
+  let isBuilding = false;
+
+  watch('./src', { recursive: true }, async (event, filename) => {
+    if (isBuilding) return;
+    if (!filename) return;
+
+    if (filename.includes('assets/')) {
+      return;
+    }
+
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+    }
+
+    debounceTimer = setTimeout(async () => {
+      if (isBuilding) return;
+      isBuilding = true;
+      console.log(`Detected change in ${filename}`);
+      try {
+        await runBuild();
+      } finally {
+        isBuilding = false;
+        debounceTimer = null;
+      }
+    }, 300);
+  });
+}
