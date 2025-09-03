@@ -1,0 +1,199 @@
+import { AlertCircle, ArrowRight, Eye, EyeOff, KeyRound, ShieldCheck } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
+
+import { ModelMuxMark } from '../components/layout/ModelMuxMark';
+import { Button } from '../components/ui/Button';
+import { useAuth } from '../contexts/AuthContext';
+
+export const Login: React.FC = () => {
+  const [key, setKey] = useState('');
+  const [showKey, setShowKey] = useState(false);
+  const { login, isAuthenticated } = useAuth();
+  const [error, setError] = useState('');
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  const requestedReturnTo = new URLSearchParams(location.search).get('returnTo');
+  const returnTo = (() => {
+    if (
+      !requestedReturnTo ||
+      !requestedReturnTo.startsWith('/') ||
+      requestedReturnTo.startsWith('//')
+    ) {
+      return null;
+    }
+    try {
+      const parsed = new URL(requestedReturnTo, window.location.origin);
+      return parsed.origin === window.location.origin
+        ? `${parsed.pathname}${parsed.search}${parsed.hash}`
+        : null;
+    } catch {
+      return null;
+    }
+  })();
+  const from = (location.state as any)?.from?.pathname || '/';
+  const appVersion: string = process.env.APP_VERSION || 'dev';
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      if (returnTo) {
+        // OAuth authorization is served by the backend rather than the UI
+        // router, so leave the SPA explicitly after completing login.
+        window.location.assign(returnTo);
+      } else {
+        navigate(from, { replace: true });
+      }
+    }
+  }, [isAuthenticated, navigate, from, returnTo]);
+
+  useEffect(() => {
+    if (isAuthenticated) return;
+    const params = new URLSearchParams(location.search);
+    const token = params.get('token');
+    if (!token) return;
+
+    // Strip token from URL immediately so it doesn't linger in the address bar.
+    navigate(returnTo ? `/login?returnTo=${encodeURIComponent(returnTo)}` : '/login', {
+      replace: true,
+    });
+    // Pre-fill the input so the user sees what's happening.
+    setKey(token);
+
+    // Attempt login — AuthContext.login sets localStorage on success.
+    login(token).then((valid) => {
+      if (!valid) {
+        setError('Invalid key. Verify the prefix and try again.');
+      }
+    });
+  }, [isAuthenticated, location.search, navigate, login]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!key.trim()) {
+      setError('Please enter a key');
+      return;
+    }
+    const valid = await login(key.trim());
+    if (!valid) {
+      setError('Invalid key. Verify the prefix and try again.');
+    }
+  };
+
+  return (
+    <div className="bg-bg-deep flex min-h-screen items-center justify-center p-4 sm:p-6">
+      {/* Background mesh */}
+      <div className="pointer-events-none fixed inset-0 opacity-50" aria-hidden="true">
+        <svg viewBox="0 0 800 600" preserveAspectRatio="xMidYMid slice" className="h-full w-full">
+          <g stroke="rgba(245,158,11,0.10)" strokeWidth="0.5" fill="none">
+            <path d="M0 200 C 200 100, 600 300, 800 180" />
+            <path d="M0 320 C 220 220, 580 420, 800 300" />
+            <path d="M0 440 C 200 340, 600 540, 800 420" />
+          </g>
+          <circle cx="160" cy="200" r="3" fill="#F59E0B" opacity="0.7" />
+          <circle cx="380" cy="260" r="3" fill="#FBBF24" opacity="0.7" />
+          <circle cx="640" cy="220" r="3" fill="#F59E0B" opacity="0.7" />
+          <circle cx="240" cy="380" r="3" fill="#FBBF24" opacity="0.5" />
+          <circle cx="560" cy="420" r="3" fill="#F59E0B" opacity="0.5" />
+        </svg>
+      </div>
+
+      <main className="relative w-full max-w-md">
+        {/* Logo + wordmark */}
+        <div className="mb-6 flex flex-wrap items-center justify-center gap-3 sm:mb-8">
+          <div className="animate-float">
+            <ModelMuxMark size={44} />
+          </div>
+          <div className="flex items-baseline gap-2">
+            <span className="amber-grad-text font-heading text-3xl font-bold tracking-tight">
+              ModelMux
+            </span>
+            <span className="text-text-muted font-mono text-[10px] tracking-[0.18em] uppercase">
+              {appVersion}
+            </span>
+          </div>
+        </div>
+
+        {/* Card */}
+        <div className="glass-bg rounded-xl p-5 shadow-2xl sm:rounded-2xl sm:p-8">
+          <div className="mb-6">
+            <h1 className="font-heading mb-1.5 text-2xl font-semibold tracking-tight">Sign in</h1>
+            <p className="text-text-secondary text-sm leading-relaxed">
+              Enter your admin key for full access, or an API key secret for a scoped view of your
+              key's activity.
+            </p>
+          </div>
+
+          <form onSubmit={handleSubmit} className="space-y-4" noValidate>
+            <input
+              type="text"
+              name="username"
+              autoComplete="username"
+              defaultValue="admin"
+              className="sr-only"
+              tabIndex={-1}
+              aria-hidden="true"
+            />
+            <div>
+              <label
+                htmlFor="adminKey"
+                className="text-text-secondary mb-1.5 block text-xs font-medium tracking-wider uppercase"
+              >
+                Admin key or API key secret
+              </label>
+              <div className="relative">
+                <KeyRound
+                  size={16}
+                  className="text-text-muted pointer-events-none absolute top-1/2 left-3 -translate-y-1/2"
+                />
+                <input
+                  id="adminKey"
+                  type={showKey ? 'text' : 'password'}
+                  autoComplete="current-password"
+                  value={key}
+                  onChange={(e) => {
+                    setKey(e.target.value);
+                    if (error) setError('');
+                  }}
+                  placeholder="sk-admin-•••• or sk-•••••••••••••"
+                  autoFocus
+                  className="border-border text-text placeholder:text-text-muted hover:border-border-2 focus:border-primary duration-fast w-full rounded-md border bg-slate-900/60 py-3 pr-10 pl-10 font-mono text-sm transition-all focus:shadow-[0_0_0_3px_rgba(245,158,11,0.18)] focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowKey((v) => !v)}
+                  className="text-text-secondary absolute top-1/2 right-2 -translate-y-1/2 rounded-md p-1.5 hover:bg-slate-700/50"
+                  aria-label={showKey ? 'Hide key' : 'Show key'}
+                >
+                  {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                </button>
+              </div>
+              {error && (
+                <div className="mt-2 flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 p-2.5 text-xs text-rose-300">
+                  <AlertCircle size={14} className="mt-0.5 flex-none" />
+                  <span>{error}</span>
+                </div>
+              )}
+            </div>
+
+            <Button type="submit" variant="primary" className="w-full py-3 text-sm font-semibold">
+              <span>Access Dashboard</span>
+              <ArrowRight size={14} />
+            </Button>
+          </form>
+
+          <div className="text-text-muted mt-6 flex flex-col gap-2 border-t border-white/5 pt-5 text-[11px] sm:flex-row sm:items-center sm:justify-between">
+            <span className="inline-flex items-center gap-1.5">
+              <ShieldCheck size={14} />
+              End-to-end encrypted
+            </span>
+          </div>
+        </div>
+
+        <p className="text-text-muted mt-6 text-center text-xs">
+          © 2026 ModelMux · Unified LLM Gateway
+        </p>
+      </main>
+    </div>
+  );
+};
