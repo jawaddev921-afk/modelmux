@@ -1,0 +1,46 @@
+import {
+  boolean,
+  integer,
+  jsonb,
+  pgEnum,
+  pgTable,
+  serial,
+  text,
+  unique,
+} from 'drizzle-orm/pg-core';
+
+import { providers } from './providers';
+
+export const modelTypeEnum = pgEnum('model_type', [
+  'chat',
+  'text',
+  'embeddings',
+  'transcriptions',
+  'speech',
+  'image',
+  'responses',
+  'decisions',
+]);
+
+export const providerModels = pgTable(
+  'provider_models',
+  {
+    id: serial('id').primaryKey(),
+    providerId: integer('provider_id')
+      .notNull()
+      .references(() => providers.id, { onDelete: 'cascade' }),
+    modelName: text('model_name').notNull(),
+    pricingConfig: jsonb('pricing_config'),
+    modelType: modelTypeEnum('model_type'),
+    accessVia: jsonb('access_via'), // string[]
+    extraBody: jsonb('extra_body'), // Record<string, any>
+    adapter: jsonb('adapter'), // string[] — model-level adapter names
+    autoCompat: boolean('auto_compat'), // Model-level override for pi-ai registry-aware compatibility mapping
+    maxConcurrency: integer('max_concurrency'), // Max concurrent requests for this model (NULL = no limit)
+    piAiModelId: text('pi_ai_model_id'), // pi-ai model ID within the pi-ai provider (e.g. 'claude-opus-4-6')
+    sortOrder: integer('sort_order').notNull().default(0),
+  },
+  (table) => ({
+    providerModelUnique: unique('uq_provider_models').on(table.providerId, table.modelName),
+  })
+);
