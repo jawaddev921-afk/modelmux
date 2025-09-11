@@ -1,0 +1,22 @@
+import { integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+
+export const mcpServers = sqliteTable('mcp_servers', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  name: text('name').notNull().unique(),
+  upstreamUrl: text('upstream_url').notNull(),
+  enabled: integer('enabled').notNull().default(1),
+  headers: text('headers'), // JSON: Record<string, string>
+  mode: text('mode').notNull().default('remote_http'),
+  launcher: text('launcher'),
+  packageName: text('package_name'),
+  args: text('args'), // JSON: string[]
+  env: text('env'), // JSON: Record<string, string>
+  port: integer('port'),
+  path: text('path'),
+  startupTimeoutMs: integer('startup_timeout_ms'),
+  rateLimitCooldownMs: integer('rate_limit_cooldown_ms').notNull().default(60000),
+  quotaCooldownMs: integer('quota_cooldown_ms').notNull().default(86400000),
+  authScheme: text('auth_scheme'),
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+});
