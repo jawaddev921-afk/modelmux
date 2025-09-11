@@ -1,0 +1,47 @@
+import { bigint, boolean, jsonb, pgEnum, pgTable, serial, text } from 'drizzle-orm/pg-core';
+
+export const selectorStrategyEnum = pgEnum('selector_strategy', [
+  'random',
+  'in_order',
+  'cost',
+  'latency',
+  'usage',
+  'quota',
+  'performance',
+]);
+
+export const aliasPriorityEnum = pgEnum('alias_priority', ['selector', 'api_match']);
+
+export const metadataSourceEnum = pgEnum('metadata_source', [
+  'openrouter',
+  'models.dev',
+  'catwalk',
+  'custom',
+]);
+
+export const modelAliases = pgTable('model_aliases', {
+  id: serial('id').primaryKey(),
+  slug: text('slug').notNull().unique(),
+  selector: selectorStrategyEnum('selector'),
+  priority: aliasPriorityEnum('priority').notNull().default('selector'),
+  modelType: text('model_type'), // 'text' | 'embeddings' | 'transcriptions' | 'speech' | 'image'
+  additionalAliases: jsonb('additional_aliases'), // string[]
+  advanced: jsonb('advanced'), // behavior objects array
+  metadataSource: metadataSourceEnum('metadata_source'),
+  metadataSourcePath: text('metadata_source_path'),
+  useImageFallthrough: boolean('use_image_fallthrough').notNull().default(false),
+  // Deprecated / Unused: Legacy model architecture parameters for removed synthetic energy estimation.
+  // Retained in schema for database backwards compatibility without requiring migrations.
+  modelArchitecture: jsonb('model_architecture'), // Deprecated / Unused: override for total_params, active_params, layers, heads, kv_lora_rank, qk_rope_head_dim, context_length, dtype
+  enforceLimits: boolean('enforce_limits').notNull().default(false),
+  stickySession: boolean('sticky_session').notNull().default(false),
+  preferredApi: jsonb('preferred_api'), // ('chat_completions' | 'messages' | 'gemini' | 'responses')[]
+  piModel: jsonb('pi_model'), // { provider: string, model_id: string }
+  targetGroups: jsonb('target_groups'), // {name, selector}[]
+  extraBody: jsonb('extra_body'), // Record<string, any>
+  generation: jsonb('generation'), // { reasoning?, maxTokens?, verbosity?, serviceTier? }
+  syntheticSafeguardApproval: boolean('synthetic_safeguard_approval').notNull().default(false),
+  compaction: jsonb('compaction'), // compaction config
+  createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+  updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+});

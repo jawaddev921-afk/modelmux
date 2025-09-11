@@ -1,0 +1,26 @@
+import { boolean, integer, pgTable, serial, text, unique } from 'drizzle-orm/pg-core';
+
+import { modelAliases } from './model-aliases';
+
+export const modelAliasTargets = pgTable(
+  'model_alias_targets',
+  {
+    id: serial('id').primaryKey(),
+    aliasId: integer('alias_id')
+      .notNull()
+      .references(() => modelAliases.id, { onDelete: 'cascade' }),
+    providerSlug: text('provider_slug'),
+    modelName: text('model_name'),
+    targetAliasSlug: text('target_alias_slug'),
+    enabled: boolean('enabled').notNull().default(true),
+    groupName: text('group_name'), // target group label
+    sortOrder: integer('sort_order').notNull().default(0),
+  },
+  (table) => ({
+    aliasProviderModelUnique: unique('uq_alias_targets').on(
+      table.aliasId,
+      table.providerSlug,
+      table.modelName
+    ),
+  })
+);

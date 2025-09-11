@@ -1,0 +1,28 @@
+import { integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+
+export const modelAliases = sqliteTable('model_aliases', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  slug: text('slug').notNull().unique(),
+  selector: text('selector'), // 'random' | 'in_order' | 'cost' | 'latency' | 'usage' | 'performance'
+  priority: text('priority').notNull().default('selector'), // 'selector' | 'api_match'
+  modelType: text('model_type'), // 'text' | 'embeddings' | 'transcriptions' | 'speech' | 'image'
+  additionalAliases: text('additional_aliases'), // JSON: string[]
+  advanced: text('advanced'), // JSON: behavior objects array
+  metadataSource: text('metadata_source'), // 'openrouter' | 'models.dev' | 'catwalk' | 'custom'
+  metadataSourcePath: text('metadata_source_path'),
+  useImageFallthrough: integer('use_image_fallthrough').notNull().default(0),
+  // Deprecated / Unused: Legacy model architecture parameters for removed synthetic energy estimation.
+  // Retained in schema for database backwards compatibility without requiring migrations.
+  modelArchitecture: text('model_architecture'), // Deprecated / Unused: JSON override for transformer params
+  enforceLimits: integer('enforce_limits').notNull().default(0),
+  stickySession: integer('sticky_session').notNull().default(0),
+  preferredApi: text('preferred_api'), // JSON: ('chat_completions' | 'messages' | 'gemini' | 'responses')[]
+  piModel: text('pi_model'), // JSON: { provider: string, model_id: string }
+  targetGroups: text('target_groups'), // JSON: {name, selector}[]
+  extraBody: text('extra_body'), // JSON: Record<string, any>
+  generation: text('generation'), // JSON: { reasoning?, maxTokens?, verbosity?, serviceTier? }
+  syntheticSafeguardApproval: integer('synthetic_safeguard_approval').notNull().default(0),
+  compaction: text('compaction'), // JSON: compaction config
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+});
