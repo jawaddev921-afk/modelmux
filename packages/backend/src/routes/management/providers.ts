@@ -1,0 +1,108 @@
+import { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+
+import { loadProviderPresets } from '../../services/provider-presets';
+import {
+  fetchModelsFromUrl,
+  validateUrlSafety,
+} from '../../services/providers/provider-model-discovery';
+import { logger } from '../../utils/logger';
+
+const fetchModelsSchema = z.object({
+  url: z.string().url(),
+  apiKey: z.string().optional(),
+});
+
+const PROVIDER_AUTH_FAILURE_STATUS_CODES = new Set([401, 403]);
+const PROVIDER_GATEWAY_ERROR_STATUS = 502;
+
+export async function registerProviderRoutes(fastify: FastifyInstance) {
+  /**
+   * GET /v0/management/provider-presets
+   * Returns the pre-configured provider preset catalog served from
+   * `packages/backend/data/provider-presets.json` (see services/provider-presets.ts).
+   */
+  fastify.get('/v0/management/provider-presets', async (_request, reply) => {
+    try {
+      const { presets, source } = await loadProviderPresets();
+      return reply.send({ data: presets, source });
+    } catch (error) {
+      logger.error(`Provider presets failed to load: ${error}`);
+      return reply.code(500).send({
+        error: {
+          message: error instanceof Error ? error.message : 'Failed to load provider presets',
+          type: 'internal_error',
+          code: 500,
+        },
+      });
+    }
+  });
+
+  fastify.post('/v0/management/providers/fetch-models', async (request, reply) => {
+    const parsed = fetchModelsSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: {
+          message: 'Invalid request body',
+          type: 'validation_error',
+          code: 400,
+          details: parsed.error.issues,
+        },
+      });
+    }
+
+    const { url, apiKey } = parsed.data;
+
+    // SSRF protection
+    const urlValidation = validateUrlSafety(url);
+    if (!urlValidation.valid) {
+      return reply.code(400).send({
+        error: {
+          message: urlValidation.error || 'Invalid URL',
+          type: 'ssrf_blocked',
+          code: 400,
+        },
+      });
+    }
+
+    try {
+      const normalized = await fetchModelsFromUrl(url, apiKey);
+      logger.debug(`Fetched ${normalized.data.length} models from ${url}`);
+      return reply.send(normalized);
+    } catch (error) {
+      if (error instanceof Error) {
+        if (error.name === 'AbortError') {
+          logger.error(`Request timeout for ${url}`);
+          return reply.code(504).send({
+            error: {
+              message: 'Request timed out after 10 seconds',
+              type: 'timeout_error',
+              code: 504,
+            },
+          });
+        }
+        logger.error(`Fetch error: ${error.message}`);
+        const providerStatusCode = (error as any).statusCode ?? 500;
+        const responseStatusCode = PROVIDER_AUTH_FAILURE_STATUS_CODES.has(providerStatusCode)
+          ? PROVIDER_GATEWAY_ERROR_STATUS
+          : providerStatusCode;
+        return reply.code(responseStatusCode).send({
+          error: {
+            message: error.message,
+            type: providerStatusCode === 500 ? 'fetch_error' : 'provider_error',
+            code: providerStatusCode,
+            details: (error as any).details,
+          },
+        });
+      }
+      logger.error('Unknown fetch error', error);
+      return reply.code(500).send({
+        error: {
+          message: 'An unexpected error occurred',
+          type: 'internal_error',
+          code: 500,
+        },
+      });
+    }
+  });
+}
