@@ -1,0 +1,293 @@
+import { Code2, Plus } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+
+import { PageContainer } from '../components/layout/PageContainer';
+import { PageHeader } from '../components/layout/PageHeader';
+import { DeleteProviderModal } from '../components/providers/DeleteProviderModal';
+import { FetchModelsModal } from '../components/providers/FetchModelsModal';
+import { ProviderAdvancedEditor } from '../components/providers/ProviderAdvancedEditor';
+import { ProviderApiUrlsEditor } from '../components/providers/ProviderApiUrlsEditor';
+import { ProviderList } from '../components/providers/ProviderList';
+import { ProviderModelsEditor } from '../components/providers/ProviderModelsEditor';
+import { ProviderOAuthEditor } from '../components/providers/ProviderOAuthEditor';
+import {
+  ApplyPresetButton,
+  ProviderPresetPicker,
+} from '../components/providers/ProviderPresetPicker';
+import { ProviderQuotaEditor } from '../components/providers/ProviderQuotaEditor';
+import { Button } from '../components/ui/Button';
+import { Card } from '../components/ui/Card';
+import { Input } from '../components/ui/Input';
+import { Modal } from '../components/ui/Modal';
+import { Switch } from '../components/ui/Switch';
+import { useProviderForm } from '../hooks/useProviderForm';
+
+export const Providers = () => {
+  const f = useProviderForm();
+  const navigate = useNavigate();
+  // Reveal state for the edit-mode preset picker lives here so the collapsed
+  // action can sit beside the URL/OAuth toggle while the panel renders in the
+  // connection section. Reset whenever the modal closes.
+  const [isPresetRevealed, setIsPresetRevealed] = useState(false);
+
+  useEffect(() => {
+    if (!f.isModalOpen) setIsPresetRevealed(false);
+  }, [f.isModalOpen]);
+
+  return (
+    <div className="flex min-h-full flex-col">
+      <PageHeader
+        title="Providers"
+        subtitle="Upstream LLM providers routed by the gateway"
+        actions={
+          <div className="flex items-center gap-2">
+            <Button
+              variant="secondary"
+              leftIcon={<Code2 size={14} />}
+              onClick={() => navigate('/providers/custom-checkers')}
+              size="sm"
+            >
+              Custom Quota Checkers
+            </Button>
+            <Button leftIcon={<Plus size={14} />} onClick={f.handleAddNew} size="sm">
+              Add provider
+            </Button>
+          </div>
+        }
+      />
+
+      <PageContainer>
+        <Card flush>
+          <ProviderList
+            providers={f.sortedProviders}
+            getQuotaDisplay={f.getQuotaDisplay}
+            onEdit={f.handleEdit}
+            onToggleEnabled={f.handleToggleEnabled}
+            onDelete={f.openDeleteModal}
+          />
+        </Card>
+
+        {/* Edit / Add Modal */}
+        <Modal
+          isOpen={f.isModalOpen}
+          onClose={() => f.setIsModalOpen(false)}
+          title={f.originalId ? `Edit Provider: ${f.originalId}` : 'Add Provider'}
+          size="lg"
+          footer={
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px' }}>
+              <Button variant="ghost" onClick={() => f.setIsModalOpen(false)}>
+                Cancel
+              </Button>
+              <Button
+                onClick={f.handleSave}
+                isLoading={f.isSaving}
+                disabled={!!f.quotaValidationError}
+              >
+                Save Provider
+              </Button>
+            </div>
+          }
+        >
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '-8px' }}>
+            {/* Preset picker — always open on create. On edit the compact
+                Apply Preset action lives beside the connection toggle and the
+                panel is rendered inside ProviderApiUrlsEditor. */}
+            {!f.originalId && (
+              <ProviderPresetPicker
+                editingProvider={f.editingProvider}
+                setEditingProvider={f.setEditingProvider}
+                onSelectionChange={f.setPresetSelected}
+              />
+            )}
+
+            {/* Basic fields */}
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-[1fr_1fr_1fr_auto] xl:items-end">
+              <Input
+                label="Unique ID"
+                value={f.editingProvider.id}
+                onChange={(e) => f.setEditingProvider({ ...f.editingProvider, id: e.target.value })}
+                placeholder="e.g. openai"
+                disabled={!!f.originalId}
+              />
+              <Input
+                label="Display Name"
+                value={f.editingProvider.name}
+                onChange={(e) =>
+                  f.setEditingProvider({ ...f.editingProvider, name: e.target.value })
+                }
+                placeholder="e.g. OpenAI Production"
+              />
+              <Input
+                label="API Key"
+                type="password"
+                value={f.editingProvider.apiKey}
+                onChange={(e) =>
+                  f.setEditingProvider({ ...f.editingProvider, apiKey: e.target.value })
+                }
+                placeholder="sk-..."
+                disabled={f.isOAuthMode}
+              />
+              <div className="flex flex-col gap-2">
+                <label className="font-body text-text-secondary text-[13px] font-medium">
+                  Enabled
+                </label>
+                <div style={{ height: '38px', display: 'flex', alignItems: 'center' }}>
+                  <Switch
+                    checked={f.editingProvider.enabled !== false}
+                    onChange={(checked) =>
+                      f.setEditingProvider({ ...f.editingProvider, enabled: checked })
+                    }
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div
+              style={{ height: '1px', background: 'var(--color-border-glass)', margin: '4px 0' }}
+            />
+
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+              {/* Left: APIs & Base URLs */}
+              <ProviderApiUrlsEditor
+                isOAuthMode={f.isOAuthMode}
+                getApiBaseUrlMap={f.getApiBaseUrlMap}
+                addApiBaseUrlEntry={f.addApiBaseUrlEntry}
+                updateApiBaseUrlEntry={f.updateApiBaseUrlEntry}
+                removeApiBaseUrlEntry={f.removeApiBaseUrlEntry}
+                editingProvider={f.editingProvider}
+                setEditingProvider={f.setEditingProvider}
+                OAUTH_PROVIDERS={f.OAUTH_PROVIDERS}
+                oauthProvidersStatus={f.oauthProvidersStatus}
+                onReloadOAuthProviders={f.reloadOAuthProviders}
+                isApiBaseUrlsOpen={f.isApiBaseUrlsOpen}
+                setIsApiBaseUrlsOpen={f.setIsApiBaseUrlsOpen}
+                presetAction={
+                  f.originalId && !isPresetRevealed ? (
+                    <ApplyPresetButton onClick={() => setIsPresetRevealed(true)} />
+                  ) : undefined
+                }
+                presetPanel={
+                  f.originalId ? (
+                    <ProviderPresetPicker
+                      editingProvider={f.editingProvider}
+                      setEditingProvider={f.setEditingProvider}
+                      onSelectionChange={f.setPresetSelected}
+                      isEditing
+                      isOAuthMode={f.isOAuthMode}
+                      isRevealed={isPresetRevealed}
+                    />
+                  ) : undefined
+                }
+              />
+
+              {/* Right: Quota Checker */}
+              <ProviderQuotaEditor
+                editingProvider={f.editingProvider}
+                setEditingProvider={f.setEditingProvider}
+                selectedQuotaCheckerType={f.selectedQuotaCheckerType}
+                selectableQuotaCheckerTypes={f.selectableQuotaCheckerTypes}
+                isOAuthMode={f.isOAuthMode}
+                oauthCheckerType={f.oauthCheckerType}
+                quotaValidationError={f.quotaValidationError}
+                customCheckerIds={f.customCheckerIds}
+              />
+            </div>
+
+            {/* OAuth Authentication (shown inside API URLs editor when OAuth mode) */}
+            {f.isOAuthMode && (
+              <ProviderOAuthEditor
+                editingProvider={f.editingProvider}
+                oauthSession={f.oauthSession}
+                oauthSessionId={f.oauthSessionId}
+                oauthPromptValue={f.oauthPromptValue}
+                setOauthPromptValue={f.setOauthPromptValue}
+                oauthManualCode={f.oauthManualCode}
+                setOauthManualCode={f.setOauthManualCode}
+                oauthSelectValue={f.oauthSelectValue}
+                setOauthSelectValue={f.setOauthSelectValue}
+                oauthError={f.oauthError}
+                oauthBusy={f.oauthBusy}
+                oauthCredentialReady={f.oauthCredentialReady}
+                oauthCredentialChecking={f.oauthCredentialChecking}
+                oauthCredentialStatus={f.oauthCredentialStatus}
+                oauthStatus={f.oauthStatus}
+                oauthIsTerminal={f.oauthIsTerminal}
+                oauthStatusLabel={f.oauthStatusLabel}
+                onStart={f.handleStartOAuth}
+                onSubmitPrompt={f.handleSubmitPrompt}
+                onSubmitManualCode={f.handleSubmitManualCode}
+                onSubmitSelect={f.handleSubmitSelect}
+                onCancel={f.handleCancelOAuth}
+                onDeleteCredential={f.handleDeleteOAuthCredential}
+              />
+            )}
+
+            {/* Advanced */}
+            <ProviderAdvancedEditor
+              editingProvider={f.editingProvider}
+              setEditingProvider={f.setEditingProvider}
+              addKV={f.addKV}
+              updateKV={f.updateKV}
+              removeKV={f.removeKV}
+            />
+
+            {/* Models */}
+            <ProviderModelsEditor
+              editingProvider={f.editingProvider}
+              setEditingProvider={f.setEditingProvider}
+              isModelsOpen={f.isModelsOpen}
+              setIsModelsOpen={f.setIsModelsOpen}
+              openModelIdx={f.openModelIdx}
+              setOpenModelIdx={f.setOpenModelIdx}
+              isModelExtraBodyOpen={f.isModelExtraBodyOpen}
+              setIsModelExtraBodyOpen={f.setIsModelExtraBodyOpen}
+              testStates={f.testStates}
+              addModel={f.addModel}
+              updateModelId={f.updateModelId}
+              updateModelConfig={f.updateModelConfig}
+              removeModel={f.removeModel}
+              addModelKV={f.addModelKV}
+              updateModelKV={f.updateModelKV}
+              removeModelKV={f.removeModelKV}
+              onOpenFetchModels={f.handleOpenFetchModels}
+              onTestModel={f.handleTestModel}
+              onDismissTestMessage={f.dismissTestMessage}
+              getApiBaseUrlMap={f.getApiBaseUrlMap}
+              isNewProvider={!f.originalId}
+              isOAuthMode={f.isOAuthMode}
+            />
+          </div>
+        </Modal>
+
+        {/* Fetch Models Modal */}
+        <FetchModelsModal
+          isOpen={f.isFetchModelsModalOpen}
+          onClose={() => f.setIsFetchModelsModalOpen(false)}
+          modelsUrl={f.modelsUrl}
+          setModelsUrl={f.setModelsUrl}
+          isFetchingModels={f.isFetchingModels}
+          fetchedModels={f.fetchedModels}
+          selectedModelIds={f.selectedModelIds}
+          fetchError={f.fetchError}
+          fetchWarning={f.fetchWarning}
+          isOAuthMode={f.isOAuthMode}
+          onFetch={f.handleFetchModels}
+          onToggleSelection={f.toggleModelSelection}
+          onSelectAll={f.selectAllFetchedModels}
+          onClearSelection={f.clearSelectedModels}
+          onAddSelected={f.handleAddSelectedModels}
+        />
+
+        {/* Delete Provider Modal */}
+        <DeleteProviderModal
+          provider={f.deleteModalProvider}
+          affectedAliases={f.affectedAliases}
+          deleteModalLoading={f.deleteModalLoading}
+          onClose={() => f.setDeleteModalProvider(null)}
+          onDelete={f.handleDelete}
+        />
+      </PageContainer>
+    </div>
+  );
+};
