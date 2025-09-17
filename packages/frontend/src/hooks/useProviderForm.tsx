@@ -1,0 +1,1327 @@
+import { findUnresolvedPresetVars, isOAuthPlaceholderUrl } from '@modelmux/shared';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+
+import { formatMeterValue } from '../components/quota/MeterValue';
+import { Badge } from '../components/ui/Badge';
+import { useToast } from '../contexts/ToastContext';
+import { api, fetchQuotaCheckers, OAuthProviderInfo, OAuthSession, Provider } from '../lib/api';
+import {
+  isDecisionsTargetAccess,
+  legacyDecisionsAccessKind,
+  migrateLegacyDecisionsAccess,
+  migrateLegacyDecisionsBaseUrls,
+} from '../lib/apiFormats';
+import { useCurrency } from '../lib/CurrencyContext';
+import {
+  collectProviderEndpointUrls,
+  isOAuthProviderDraft,
+  PI_AI_AUTO_VALUE,
+} from '../lib/piAiProvider';
+import type { QuotaCheckerInfo } from '../types/quota';
+import type { OAuthCredentialStatus } from '../types/settings';
+
+const KNOWN_APIS = [
+  'chat',
+  'completions',
+  'messages',
+  'gemini',
+  'embeddings',
+  'transcriptions',
+  'speech',
+  'openai-images',
+  'openrouter-images',
+  'codex-images',
+  'systemone',
+  'responses',
+  'ollama',
+];
+
+const getOAuthCheckerType = (oauthProvider?: string): string | null => {
+  if (!oauthProvider) return null;
+  const map: Record<string, string> = {
+    'openai-codex': 'openai-codex',
+    anthropic: 'claude-code',
+    'claude-code': 'claude-code',
+    'github-copilot': 'copilot',
+    meta: 'muse-code',
+  };
+  return map[oauthProvider] ?? null;
+};
+
+const inferProviderTypes = (apiBaseUrl?: string | Record<string, string>): string[] => {
+  if (!apiBaseUrl) return ['chat'];
+  if (typeof apiBaseUrl === 'string') {
+    const url = apiBaseUrl.trim().toLowerCase();
+    if (isOAuthPlaceholderUrl(apiBaseUrl)) return ['oauth'];
+    if (url.includes('anthropic.com')) return ['messages'];
+    if (url.includes('generativelanguage.googleapis.com')) return ['gemini'];
+    return ['chat'];
+  }
+  return Object.keys(apiBaseUrl).filter((key) => {
+    const value = apiBaseUrl[key];
+    return typeof value === 'string' && value.length > 0;
+  });
+};
+
+export const EMPTY_PROVIDER: Provider = {
+  id: '',
+  name: '',
+  type: [],
+  apiKey: '',
+  oauthProvider: '',
+  enabled: true,
+  disableCooldown: false,
+  stallCooldown: false,
+  allow100PercentUtilization: false,
+  estimateTokens: false,
+  useClaudeMasking: false,
+  cacheKeyInjection: undefined,
+  responsesExtensions: undefined,
+  apiBaseUrl: {},
+  headers: {},
+  extraBody: {},
+  models: {},
+  modelAutosync: { enabled: false, intervalMinutes: 60 },
+  adapter: [],
+  timeoutMs: undefined,
+  maxConcurrency: undefined,
+  rawPassthrough: {
+    enabled: false,
+    baseUrl: '',
+    auth: 'bearer',
+  },
+};
+
+export interface FetchedModel {
+  id: string;
+  name?: string;
+  context_length?: number;
+  created?: number;
+  object?: string;
+  owned_by?: string;
+  description?: string;
+  pricing?: { prompt?: string; completion?: string };
+  /** Modality hint — image models are added with an image-only protocol. */
+  type?: 'text' | 'image';
+  /** Protocols this model can be reached through (e.g. `codex-images`). */
+  access_via?: string[];
+  /** `hide` models work but the upstream does not advertise them. */
+  visibility?: 'list' | 'hide';
+}
+
+/** Load state of the OAuth provider list: loading, failed, or loaded. */
+export type OAuthProvidersStatus = 'loading' | 'error' | 'ready';
+
+/** Fallback protocol for Codex image models when the backend sends none. */
+const CODEX_IMAGE_ACCESS = 'codex-images';
+const CODEX_OAUTH_PROVIDER = 'openai-codex';
+
+export function useProviderForm() {
+  const toast = useToast();
+  const navigate = useNavigate();
+  const { currency, rate, symbol } = useCurrency();
+
+  const [providers, setProviders] = useState<Provider[]>([]);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [editingProvider, setEditingProvider] = useState<Provider>(EMPTY_PROVIDER);
+  const [originalId, setOriginalId] = useState<string | null>(null);
+  const [presetSelected, setPresetSelected] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [quotaCheckerTypes, setQuotaCheckerTypes] = useState<string[]>([]);
+  // Populated from the backend, which surfaces every OAuth-capable provider
+  // pi-ai ships — new provider flows (e.g. xAI, Kimi Code, OpenRouter) show
+  // up here automatically with no frontend change.
+  const [oauthProviders, setOauthProviders] = useState<OAuthProviderInfo[]>([]);
+  const [oauthProvidersStatus, setOauthProvidersStatus] = useState<OAuthProvidersStatus>('loading');
+  const OAUTH_PROVIDERS = oauthProviders.map((p) => ({ value: p.id, label: p.name }));
+  const [customCheckerIds, setCustomCheckerIds] = useState<string[]>([]);
+  const [quotas, setQuotas] = useState<QuotaCheckerInfo[]>([]);
+  const [quotasLoading, setQuotasLoading] = useState(true);
+
+  const [oauthSessionId, setOauthSessionId] = useState<string | null>(null);
+  const [oauthSession, setOauthSession] = useState<OAuthSession | null>(null);
+  const [oauthPromptValue, setOauthPromptValue] = useState('');
+  const [oauthManualCode, setOauthManualCode] = useState('');
+  const [oauthSelectValue, setOauthSelectValue] = useState('');
+  const [oauthError, setOauthError] = useState<string | null>(null);
+  const [oauthBusy, setOauthBusy] = useState(false);
+  const [oauthCredentialReady, setOauthCredentialReady] = useState(false);
+  const [oauthCredentialChecking, setOauthCredentialChecking] = useState(false);
+  // Credential age (connected / refreshed / expires) for the status line.
+  const [oauthCredentialStatus, setOauthCredentialStatus] = useState<OAuthCredentialStatus | null>(
+    null
+  );
+
+  // Accordion state
+  const [isModelsOpen, setIsModelsOpen] = useState(false);
+  const [openModelIdx, setOpenModelIdx] = useState<string | null>(null);
+  const [isApiBaseUrlsOpen, setIsApiBaseUrlsOpen] = useState(true);
+  const [isHeadersOpen, setIsHeadersOpen] = useState(false);
+  const [isExtraBodyOpen, setIsExtraBodyOpen] = useState(false);
+  const [isModelExtraBodyOpen, setIsModelExtraBodyOpen] = useState<Record<string, boolean>>({});
+  const [isAdvancedOpen, setIsAdvancedOpen] = useState(false);
+
+  // Fetch Models Modal state
+  const [isFetchModelsModalOpen, setIsFetchModelsModalOpen] = useState(false);
+  const [modelsUrl, setModelsUrl] = useState('');
+  const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
+  const [selectedModelIds, setSelectedModelIds] = useState<Set<string>>(new Set());
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  // A catalog fallback is a warning, not an error: the list is still usable.
+  const [fetchWarning, setFetchWarning] = useState<string | null>(null);
+
+  const [deleteModalProvider, setDeleteModalProvider] = useState<Provider | null>(null);
+  const [deleteModalLoading, setDeleteModalLoading] = useState(false);
+  const [affectedAliases, setAffectedAliases] = useState<
+    { aliasId: string; targetsCount: number }[]
+  >([]);
+
+  type TestState = {
+    loading: boolean;
+    result?: 'success' | 'error';
+    message?: string;
+    showResult: boolean;
+    showMessage?: boolean;
+  };
+  const [testStates, setTestStates] = useState<Record<string, TestState>>({});
+  const nextTestRequestId = useRef(0);
+  const activeTestRequests = useRef(new Map<number, string>());
+
+  const updateTestState = (testKey: string, update: (state: TestState) => TestState) => {
+    setTestStates((prev) => {
+      const current = prev[testKey];
+      if (!current) return prev;
+      return { ...prev, [testKey]: update(current) };
+    });
+  };
+
+  const updateTestStateForRequest = (
+    requestId: number,
+    update: (state: TestState) => TestState
+  ) => {
+    setTestStates((prev) => {
+      const testKey = activeTestRequests.current.get(requestId);
+      const current = testKey ? prev[testKey] : undefined;
+      if (!testKey || !current) return prev;
+      return { ...prev, [testKey]: update(current) };
+    });
+  };
+
+  const migrateTestStateKey = (oldTestKey: string, newTestKey: string) => {
+    for (const [requestId, testKey] of activeTestRequests.current) {
+      if (testKey === oldTestKey) {
+        activeTestRequests.current.set(requestId, newTestKey);
+      }
+    }
+
+    setTestStates((prev) => {
+      if (!Object.prototype.hasOwnProperty.call(prev, oldTestKey)) return prev;
+      const next = { ...prev, [newTestKey]: prev[oldTestKey] };
+      delete next[oldTestKey];
+      return next;
+    });
+  };
+
+  const removeTestStateKey = (testKey: string) => {
+    for (const [requestId, activeKey] of activeTestRequests.current) {
+      if (activeKey === testKey) {
+        activeTestRequests.current.delete(requestId);
+      }
+    }
+
+    setTestStates((prev) => {
+      if (!Object.prototype.hasOwnProperty.call(prev, testKey)) return prev;
+      const next = { ...prev };
+      delete next[testKey];
+      return next;
+    });
+  };
+
+  // Derived
+  const isOAuthMode =
+    typeof editingProvider.apiBaseUrl === 'string' &&
+    isOAuthPlaceholderUrl(editingProvider.apiBaseUrl);
+  const oauthCheckerType = isOAuthMode ? getOAuthCheckerType(editingProvider.oauthProvider) : null;
+  const selectableQuotaCheckerTypes = oauthCheckerType
+    ? [oauthCheckerType]
+    : isOAuthMode
+      ? []
+      : quotaCheckerTypes;
+  const selectedQuotaCheckerType =
+    editingProvider.quotaChecker?.type &&
+    (selectableQuotaCheckerTypes.includes(editingProvider.quotaChecker.type) ||
+      editingProvider.quotaChecker.type === oauthCheckerType)
+      ? editingProvider.quotaChecker.type
+      : '';
+
+  const oauthStatus = oauthSession?.status;
+  const oauthIsTerminal = oauthStatus
+    ? ['success', 'error', 'cancelled'].includes(oauthStatus)
+    : false;
+  const oauthStatusLabel = oauthStatus
+    ? {
+        in_progress: 'Starting',
+        awaiting_auth: 'Awaiting browser',
+        awaiting_prompt: 'Awaiting input',
+        awaiting_manual_code: 'Awaiting code',
+        awaiting_select: 'Awaiting method',
+        success: 'Authenticated',
+        error: 'Error',
+        cancelled: 'Cancelled',
+      }[oauthStatus] || oauthStatus
+    : oauthCredentialChecking
+      ? 'Checking...'
+      : oauthCredentialReady
+        ? 'Ready'
+        : 'Not started';
+
+  // Effects
+  useEffect(() => {
+    fetchQuotaCheckers().then((res) => {
+      setQuotaCheckerTypes(res.knownTypes.map((t) => t.type));
+      setCustomCheckerIds(res.knownTypes.filter((t) => t.custom).map((t) => t.type));
+    });
+  }, []);
+
+  const reloadOAuthProviders = useCallback(async () => {
+    setOauthProvidersStatus('loading');
+    try {
+      setOauthProviders(await api.getOAuthProviders());
+      setOauthProvidersStatus('ready');
+    } catch {
+      setOauthProviders([]);
+      setOauthProvidersStatus('error');
+    }
+  }, []);
+
+  useEffect(() => {
+    void reloadOAuthProviders();
+  }, [reloadOAuthProviders]);
+
+  useEffect(() => {
+    api
+      .getQuotas()
+      .then(setQuotas)
+      .catch(() => {})
+      .finally(() => setQuotasLoading(false));
+  }, []);
+
+  const loadData = async () => {
+    try {
+      const p = await api.getProviders();
+      setProviders(p);
+    } catch (e) {
+      console.error('Failed to load data', e);
+    }
+  };
+
+  useEffect(() => {
+    loadData();
+    const interval = setInterval(loadData, 10000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Modal close resets OAuth
+  useEffect(() => {
+    if (!isModalOpen) {
+      resetOAuthState();
+      setOauthCredentialReady(false);
+      setOauthCredentialStatus(null);
+      setOauthCredentialChecking(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isModalOpen]);
+
+  // OAuth credential check
+  useEffect(() => {
+    if (!isModalOpen || !isOAuthMode) {
+      setOauthCredentialReady(false);
+      setOauthCredentialStatus(null);
+      setOauthCredentialChecking(false);
+      return;
+    }
+    const providerId = editingProvider.oauthProvider || (OAUTH_PROVIDERS[0]?.value ?? '');
+    // The OAuth account is the provider ID (1:1) — never typed separately.
+    const accountId = editingProvider.id.trim();
+    if (!accountId) {
+      setOauthCredentialReady(false);
+      setOauthCredentialStatus(null);
+      setOauthCredentialChecking(false);
+      return;
+    }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const checkStatus = async (initial: boolean) => {
+      if (initial) setOauthCredentialChecking(true);
+      try {
+        const result = await api.getOAuthCredentialStatus(providerId, accountId);
+        if (cancelled) return;
+        setOauthCredentialReady(!!result.ready);
+        setOauthCredentialStatus(result.ready ? result : null);
+      } catch {
+        if (cancelled) return;
+        if (initial) {
+          setOauthCredentialReady(false);
+          setOauthCredentialStatus(null);
+        }
+      } finally {
+        if (!cancelled) {
+          if (initial) setOauthCredentialChecking(false);
+          timer = setTimeout(() => void checkStatus(false), 10_000);
+        }
+      }
+    };
+    void checkStatus(true);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [isModalOpen, isOAuthMode, editingProvider.oauthProvider, editingProvider.id, oauthStatus]);
+
+  useEffect(() => {
+    if (!isOAuthMode) return;
+    resetOAuthState();
+  }, [editingProvider.oauthProvider, isOAuthMode]);
+
+  // Auto-detect the pi-ai provider for new Custom drafts only. A preset
+  // explicitly chooses builtin, inline quirks, or neither; URL matching must
+  // not override that choice. Existing configs and manual selections are
+  // never changed.
+  const lastAutoSuggestion = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!isModalOpen) {
+      lastAutoSuggestion.current = null;
+      return;
+    }
+    if (originalId !== null) return;
+    if (presetSelected) return;
+    const urls = collectProviderEndpointUrls(editingProvider.apiBaseUrl);
+    const oauthProvider = isOAuthProviderDraft(editingProvider.apiBaseUrl)
+      ? editingProvider.oauthProvider?.trim() || undefined
+      : undefined;
+    if (urls.length === 0 && !oauthProvider) return;
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      let suggestion: string | null = null;
+      try {
+        suggestion = await api.resolvePiAiProvider({ urls, oauthProvider });
+      } catch {
+        return; // non-fatal — the user can still pick manually
+      }
+      if (cancelled || !suggestion) return;
+      const previous = lastAutoSuggestion.current;
+      lastAutoSuggestion.current = suggestion;
+      setEditingProvider((prev) => {
+        if (prev.pi_ai_quirks) return prev;
+        const current = prev.pi_ai_provider;
+        const untouched = !current || current === PI_AI_AUTO_VALUE || current === previous;
+        if (!untouched) return prev;
+        if (current === suggestion && prev.auto_compat === true) return prev;
+        return { ...prev, pi_ai_provider: suggestion, auto_compat: true };
+      });
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [
+    isModalOpen,
+    originalId,
+    presetSelected,
+    editingProvider.apiBaseUrl,
+    editingProvider.oauthProvider,
+  ]);
+
+  // OAuth session polling
+  useEffect(() => {
+    if (!oauthSessionId) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const session = await api.getOAuthSession(oauthSessionId);
+        if (cancelled) return;
+        setOauthSession(session);
+        if (
+          ['awaiting_prompt', 'awaiting_manual_code', 'awaiting_select', 'awaiting_auth'].includes(
+            session.status
+          )
+        ) {
+          setOauthBusy(false);
+        }
+        if (['success', 'error', 'cancelled'].includes(session.status)) {
+          setOauthBusy(false);
+          return;
+        }
+        setTimeout(poll, 1000);
+      } catch (error) {
+        if (!cancelled) {
+          setOauthError(error instanceof Error ? error.message : 'Failed to load OAuth session');
+          setOauthBusy(false);
+        }
+      }
+    };
+    poll();
+    return () => {
+      cancelled = true;
+    };
+  }, [oauthSessionId]);
+
+  // Handlers
+  const handleEdit = (provider: Provider) => {
+    setPresetSelected(false);
+    setOriginalId(provider.id);
+    const cloned: Provider = JSON.parse(JSON.stringify(provider));
+    // Collapse legacy Decisions config onto `systemone` when the form loads
+    // so saving persists the migration (the backend normalizes at runtime
+    // regardless). Both halves migrate together: models without a matching
+    // base URL (or vice versa) would leave the row internally inconsistent.
+    const migratedBaseUrls = migrateLegacyDecisionsBaseUrls(cloned.apiBaseUrl);
+    if (migratedBaseUrls !== cloned.apiBaseUrl) cloned.apiBaseUrl = migratedBaseUrls;
+    if (cloned.models && !Array.isArray(cloned.models)) {
+      for (const [modelId, modelConfig] of Object.entries(cloned.models)) {
+        const cfg = modelConfig as { access_via?: unknown; type?: unknown };
+        const access = cfg?.access_via;
+        if (!Array.isArray(access)) continue;
+        const migrated = migrateLegacyDecisionsAccess(access);
+        // A legacy model whose access_via is entirely decisions-capable is
+        // really a decisions-only model from before `type: 'decisions'`
+        // existed — convert it once, at load, so the editor form reflects
+        // the canonical shape. Explicit decisions entries are kept (they may
+        // carry subtypes); routing is identical.
+        if ((cfg.type ?? 'text') !== 'decisions' && legacyDecisionsAccessKind(access) === 'pure') {
+          (cloned.models as Record<string, unknown>)[modelId] = {
+            ...cfg,
+            type: 'decisions',
+            access_via: migrated,
+          };
+        } else if (migrated && JSON.stringify(migrated) !== JSON.stringify(access)) {
+          (cloned.models as Record<string, unknown>)[modelId] = {
+            ...cfg,
+            access_via: migrated,
+          };
+        }
+      }
+    }
+    setEditingProvider(cloned);
+    setIsModalOpen(true);
+  };
+
+  const handleAddNew = () => {
+    setPresetSelected(false);
+    setOriginalId(null);
+    setEditingProvider(JSON.parse(JSON.stringify(EMPTY_PROVIDER)));
+    setIsModalOpen(true);
+  };
+
+  const openDeleteModal = async (provider: Provider) => {
+    const affected = await api.getAffectedAliases(provider.id);
+    setAffectedAliases(affected);
+    setDeleteModalProvider(provider);
+  };
+
+  const handleDelete = async (cascade: boolean) => {
+    if (!deleteModalProvider) return;
+    setDeleteModalLoading(true);
+    try {
+      await api.deleteProvider(deleteModalProvider.id, cascade);
+      await loadData();
+      setDeleteModalProvider(null);
+    } catch (e) {
+      toast.error('Failed to delete provider: ' + e);
+    } finally {
+      setDeleteModalLoading(false);
+    }
+  };
+
+  const handleSave = async () => {
+    if (!editingProvider.id) {
+      toast.error('Provider ID is required');
+      return;
+    }
+    // Template placeholders (e.g. a preset's {account_id}) are never valid
+    // upstream hosts — the backend accepts map values verbatim, so block
+    // the save here instead of persisting a broken provider.
+    const unresolvedTemplateVars =
+      typeof editingProvider.apiBaseUrl === 'object' && editingProvider.apiBaseUrl !== null
+        ? findUnresolvedPresetVars(editingProvider.apiBaseUrl as Record<string, string>)
+        : [];
+    if (unresolvedTemplateVars.length > 0) {
+      toast.error(`Fill in template values (${unresolvedTemplateVars.join(', ')}) before saving`);
+      return;
+    }
+    setIsSaving(true);
+    try {
+      let providerToSave = editingProvider;
+      // `- auto -` resolves to a concrete id on select and should never be
+      // saved; drop it defensively if it ever lingers in the draft.
+      if (providerToSave.pi_ai_provider === PI_AI_AUTO_VALUE) {
+        providerToSave = { ...providerToSave, pi_ai_provider: undefined };
+      }
+      if (isOAuthMode && !providerToSave.oauthProvider) {
+        providerToSave = { ...providerToSave, oauthProvider: OAUTH_PROVIDERS[0]?.value ?? '' };
+      }
+      if (providerToSave.rawPassthrough?.enabled) {
+        if (isOAuthMode) {
+          toast.error('Raw passthrough currently supports static API-key providers only');
+          return;
+        }
+        try {
+          const rawBaseUrl = new URL(providerToSave.rawPassthrough.baseUrl);
+          if (!['http:', 'https:'].includes(rawBaseUrl.protocol)) throw new Error();
+        } catch {
+          toast.error('Raw passthrough requires a valid HTTP(S) base URL');
+          return;
+        }
+      }
+      if (providerToSave.quotaChecker && !providerToSave.quotaChecker.type?.trim()) {
+        providerToSave = { ...providerToSave, quotaChecker: undefined };
+      }
+      await api.saveProvider(providerToSave, originalId || undefined);
+      await loadData();
+      setIsModalOpen(false);
+    } catch (e) {
+      console.error('Save error', e);
+      toast.error('Failed to save provider: ' + e);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleToggleEnabled = async (provider: Provider, newState: boolean) => {
+    setProviders(providers.map((p) => (p.id === provider.id ? { ...p, enabled: newState } : p)));
+    try {
+      await api.updateProviderEnabled(provider.id, newState);
+    } catch (e) {
+      console.error('Toggle error', e);
+      toast.error('Failed to update provider status: ' + e);
+      loadData();
+    }
+  };
+
+  const handleTestModel = async (providerId: string, modelId: string, modelType?: string) => {
+    const testKey = `${providerId}-${modelId}`;
+    const requestId = ++nextTestRequestId.current;
+    activeTestRequests.current.set(requestId, testKey);
+    setTestStates((prev) => ({
+      ...prev,
+      [testKey]: { loading: true, showResult: true, showMessage: false },
+    }));
+    const provider =
+      editingProvider.id === providerId
+        ? editingProvider
+        : providers.find((candidate) => candidate.id === providerId);
+    const accessVia: string[] | undefined = Array.isArray(provider?.models)
+      ? undefined
+      : provider?.models?.[modelId]?.access_via;
+    // A decisions probe goes only to a decisions-typed model, a model with
+    // an explicit decisions `access_via` entry, or an unconstrained model on
+    // a provider whose every base URL is decisions-capable (otherwise a
+    // System One-only provider's rows would get a chat probe the router
+    // rejects). Inferred types on a shared provider must not drive this: a
+    // Text model with empty `access_via` alongside a chat URL is still a
+    // chat model.
+    const inferredTypes = accessVia?.length ? [] : inferProviderTypes(provider?.apiBaseUrl);
+    const usesDecisions =
+      modelType === 'decisions' ||
+      (accessVia ?? []).some((type) => isDecisionsTargetAccess(type)) ||
+      (inferredTypes.length > 0 && inferredTypes.every((type) => isDecisionsTargetAccess(type)));
+    let testApiTypes: string[] = ['chat'];
+    if (usesDecisions) testApiTypes = ['decisions'];
+    else if (modelType === 'embeddings') testApiTypes = ['embeddings'];
+    else if (modelType === 'image') testApiTypes = ['images'];
+    else if (modelType === 'responses') testApiTypes = ['responses'];
+    else if (modelType === 'transcriptions') testApiTypes = ['transcriptions'];
+    else if (modelType === 'speech') testApiTypes = ['speech'];
+    try {
+      const results = await Promise.all(
+        testApiTypes.map((t) => api.testModel(providerId, modelId, t))
+      );
+      const allSuccess = results.every((r) => r.success);
+      const firstError = results.find((r) => !r.success);
+      const totalDuration = results.reduce((sum, r) => sum + (r.durationMs || 0), 0);
+      const avgDuration = Math.round(totalDuration / results.length);
+      updateTestStateForRequest(requestId, (state) => ({
+        ...state,
+        loading: false,
+        result: allSuccess ? 'success' : 'error',
+        message: allSuccess
+          ? usesDecisions
+            ? `Success (${avgDuration}ms): ${results[0]?.response || ''}`
+            : `Success (${avgDuration}ms avg, ${testApiTypes.length} API${testApiTypes.length > 1 ? 's' : ''})`
+          : `Failed via ${firstError?.apiType || 'unknown'}: ${firstError?.error || 'Test failed'}`,
+        showResult: true,
+        showMessage: true,
+      }));
+      setTimeout(
+        () => {
+          updateTestStateForRequest(requestId, (state) => ({ ...state, showResult: false }));
+          if (!allSuccess) activeTestRequests.current.delete(requestId);
+        },
+        allSuccess ? 3000 : 1500
+      );
+      if (allSuccess) {
+        setTimeout(() => {
+          updateTestStateForRequest(requestId, (state) => ({ ...state, showMessage: false }));
+          activeTestRequests.current.delete(requestId);
+        }, 3000);
+      }
+    } catch (e) {
+      updateTestStateForRequest(requestId, (state) => ({
+        ...state,
+        loading: false,
+        result: 'error',
+        message: String(e),
+        showResult: true,
+        showMessage: true,
+      }));
+      setTimeout(() => {
+        updateTestStateForRequest(requestId, (state) => ({ ...state, showResult: false }));
+        activeTestRequests.current.delete(requestId);
+      }, 1500);
+    }
+  };
+
+  const dismissTestMessage = (testKey: string) => {
+    updateTestState(testKey, (state) => ({ ...state, showMessage: false }));
+  };
+
+  // OAuth handlers
+  const resetOAuthState = () => {
+    setOauthSessionId(null);
+    setOauthSession(null);
+    setOauthPromptValue('');
+    setOauthManualCode('');
+    setOauthSelectValue('');
+    setOauthError(null);
+    setOauthBusy(false);
+  };
+
+  const handleStartOAuth = async () => {
+    const providerId = editingProvider.oauthProvider || (OAUTH_PROVIDERS[0]?.value ?? '');
+    const accountId = editingProvider.id.trim();
+    if (!accountId) {
+      setOauthError('Provider ID is required before starting login');
+      return;
+    }
+    setOauthBusy(true);
+    setOauthError(null);
+    setOauthSession(null);
+    setOauthSessionId(null);
+    try {
+      const session = await api.startOAuthSession(providerId, accountId);
+      setOauthSessionId(session.id);
+      setOauthSession(session);
+      if (
+        ['awaiting_prompt', 'awaiting_manual_code', 'awaiting_select', 'awaiting_auth'].includes(
+          session.status
+        )
+      )
+        setOauthBusy(false);
+    } catch (error) {
+      setOauthError(error instanceof Error ? error.message : 'Failed to start OAuth');
+      setOauthBusy(false);
+    }
+  };
+
+  const handleSubmitPrompt = async () => {
+    if (!oauthSessionId) return;
+    setOauthBusy(true);
+    setOauthError(null);
+    try {
+      const session = await api.submitOAuthPrompt(oauthSessionId, oauthPromptValue);
+      setOauthSession(session);
+      setOauthPromptValue('');
+    } catch (error) {
+      setOauthError(error instanceof Error ? error.message : 'Failed to submit prompt');
+    } finally {
+      setOauthBusy(false);
+    }
+  };
+
+  const handleSubmitManualCode = async () => {
+    if (!oauthSessionId) return;
+    setOauthBusy(true);
+    setOauthError(null);
+    try {
+      const session = await api.submitOAuthManualCode(oauthSessionId, oauthManualCode);
+      setOauthSession(session);
+      setOauthManualCode('');
+    } catch (error) {
+      setOauthError(error instanceof Error ? error.message : 'Failed to submit code');
+    } finally {
+      setOauthBusy(false);
+    }
+  };
+
+  const handleSubmitSelect = async () => {
+    if (!oauthSessionId || !oauthSession?.select) return;
+    const value = oauthSelectValue || oauthSession.select.options[0]?.id;
+    if (!value) return;
+    setOauthBusy(true);
+    setOauthError(null);
+    try {
+      const session = await api.submitOAuthSelect(oauthSessionId, value);
+      setOauthSession(session);
+      setOauthSelectValue('');
+    } catch (error) {
+      setOauthError(error instanceof Error ? error.message : 'Failed to submit selection');
+    } finally {
+      setOauthBusy(false);
+    }
+  };
+
+  const handleCancelOAuth = async () => {
+    if (!oauthSessionId) return;
+    setOauthBusy(true);
+    setOauthError(null);
+    try {
+      const session = await api.cancelOAuthSession(oauthSessionId);
+      setOauthSession(session);
+    } catch (error) {
+      setOauthError(error instanceof Error ? error.message : 'Failed to cancel session');
+    } finally {
+      setOauthBusy(false);
+    }
+  };
+
+  const handleDeleteOAuthCredential = async () => {
+    const providerId = editingProvider.oauthProvider || (OAUTH_PROVIDERS[0]?.value ?? '');
+    const accountId = editingProvider.id.trim();
+    if (!accountId) {
+      setOauthError('Provider ID is required');
+      return;
+    }
+    setOauthBusy(true);
+    setOauthError(null);
+    try {
+      await api.deleteOAuthCredentials(providerId, accountId);
+      setOauthCredentialReady(false);
+      setOauthCredentialStatus(null);
+      resetOAuthState();
+    } catch (error) {
+      setOauthError(error instanceof Error ? error.message : 'Failed to delete OAuth credentials');
+    } finally {
+      setOauthBusy(false);
+    }
+  };
+
+  // API URL helpers
+  const getApiBaseUrlMap = (): Record<string, string> => {
+    if (
+      typeof editingProvider.apiBaseUrl === 'object' &&
+      editingProvider.apiBaseUrl !== null &&
+      !Array.isArray(editingProvider.apiBaseUrl)
+    ) {
+      return { ...(editingProvider.apiBaseUrl as Record<string, string>) };
+    }
+    if (typeof editingProvider.apiBaseUrl === 'string' && editingProvider.apiBaseUrl.trim()) {
+      const inferredTypes = inferProviderTypes(editingProvider.apiBaseUrl);
+      return { [inferredTypes[0] || 'chat']: editingProvider.apiBaseUrl };
+    }
+    return {};
+  };
+
+  const getApiUrlValue = (apiType: string) => {
+    if (typeof editingProvider.apiBaseUrl === 'string') {
+      const types = Array.isArray(editingProvider.type)
+        ? editingProvider.type
+        : [editingProvider.type];
+      if (types.includes(apiType) && types.length === 1) return editingProvider.apiBaseUrl;
+      return '';
+    }
+    return getApiBaseUrlMap()[apiType] || '';
+  };
+
+  const addApiBaseUrlEntry = () => {
+    if (isOAuthMode) return;
+    const currentMap = getApiBaseUrlMap();
+    const nextType = KNOWN_APIS.find((t) => !(t in currentMap));
+    if (!nextType) return;
+    const updated = { ...currentMap, [nextType]: '' };
+    setEditingProvider({
+      ...editingProvider,
+      apiBaseUrl: updated,
+      type: inferProviderTypes(updated),
+    });
+    setIsApiBaseUrlsOpen(true);
+  };
+
+  const updateApiBaseUrlEntry = (oldType: string, newType: string, url: string) => {
+    if (isOAuthMode) return;
+    const currentMap = getApiBaseUrlMap();
+    const updated: Record<string, string> = { ...currentMap };
+    delete updated[oldType];
+    const normalizedType = newType.trim();
+    if (normalizedType) updated[normalizedType] = url;
+    setEditingProvider({
+      ...editingProvider,
+      apiBaseUrl: updated,
+      type: inferProviderTypes(updated),
+    });
+  };
+
+  const removeApiBaseUrlEntry = (apiType: string) => {
+    if (isOAuthMode) return;
+    const currentMap = getApiBaseUrlMap();
+    const updated = { ...currentMap };
+    delete updated[apiType];
+    setEditingProvider({
+      ...editingProvider,
+      apiBaseUrl: updated,
+      type: inferProviderTypes(updated),
+    });
+  };
+
+  // Generic KV helpers
+  const addKV = (field: 'headers' | 'extraBody') => {
+    const current = editingProvider[field] || {};
+    setEditingProvider({ ...editingProvider, [field]: { ...current, '': '' } });
+  };
+
+  const updateKV = (field: 'headers' | 'extraBody', oldKey: string, newKey: string, value: any) => {
+    const current = { ...(editingProvider[field] || {}) };
+    if (oldKey !== newKey) delete current[oldKey];
+    current[newKey] = value;
+    setEditingProvider({ ...editingProvider, [field]: current });
+  };
+
+  const removeKV = (field: 'headers' | 'extraBody', key: string) => {
+    const current = { ...(editingProvider[field] || {}) };
+    delete current[key];
+    setEditingProvider({ ...editingProvider, [field]: current });
+  };
+
+  // Model-level extraBody helpers
+  const addModelKV = (modelId: string) => {
+    const models = { ...(editingProvider.models as Record<string, any>) };
+    const current = models[modelId]?.extraBody || {};
+    models[modelId] = { ...models[modelId], extraBody: { ...current, '': '' } };
+    setEditingProvider({ ...editingProvider, models });
+  };
+
+  const updateModelKV = (modelId: string, oldKey: string, newKey: string, value: any) => {
+    const models = { ...(editingProvider.models as Record<string, any>) };
+    const current = { ...(models[modelId]?.extraBody || {}) };
+    if (oldKey !== newKey) delete current[oldKey];
+    current[newKey] = value;
+    models[modelId] = { ...models[modelId], extraBody: current };
+    setEditingProvider({ ...editingProvider, models });
+  };
+
+  const removeModelKV = (modelId: string, key: string) => {
+    const models = { ...(editingProvider.models as Record<string, any>) };
+    const current = { ...(models[modelId]?.extraBody || {}) };
+    delete current[key];
+    models[modelId] = { ...models[modelId], extraBody: current };
+    setEditingProvider({ ...editingProvider, models });
+  };
+
+  // Model management
+  const addModel = () => {
+    const modelId = `model-${Date.now()}`;
+    const newModels = {
+      ...(typeof editingProvider.models === 'object' && !Array.isArray(editingProvider.models)
+        ? editingProvider.models
+        : {}),
+    };
+    newModels[modelId] = { pricing: { source: 'simple', input: 0, output: 0 }, access_via: [] };
+    setEditingProvider({ ...editingProvider, models: newModels });
+    setOpenModelIdx(modelId);
+  };
+
+  const updateModelId = (oldId: string, newId: string) => {
+    if (oldId === newId) return;
+    const models = { ...(editingProvider.models as Record<string, any>) };
+    models[newId] = models[oldId];
+    delete models[oldId];
+    setEditingProvider({ ...editingProvider, models });
+    if (openModelIdx === oldId) setOpenModelIdx(newId);
+    const oldTestKey = `${editingProvider.id}-${oldId}`;
+    const newTestKey = `${editingProvider.id}-${newId}`;
+    setIsModelExtraBodyOpen((prev) => {
+      if (!Object.prototype.hasOwnProperty.call(prev, oldId)) return prev;
+      const next = { ...prev, [newId]: prev[oldId] };
+      delete next[oldId];
+      return next;
+    });
+    migrateTestStateKey(oldTestKey, newTestKey);
+  };
+
+  const updateModelConfig = (modelId: string, updates: any) => {
+    const models = { ...(editingProvider.models as Record<string, any>) };
+    models[modelId] = { ...models[modelId], ...updates };
+    setEditingProvider({ ...editingProvider, models });
+  };
+
+  const removeModel = (modelId: string) => {
+    const models = { ...(editingProvider.models as Record<string, any>) };
+    delete models[modelId];
+    setEditingProvider({ ...editingProvider, models });
+    if (openModelIdx === modelId) setOpenModelIdx(null);
+    const testKey = `${editingProvider.id}-${modelId}`;
+    setIsModelExtraBodyOpen((prev) => {
+      if (!Object.prototype.hasOwnProperty.call(prev, modelId)) return prev;
+      const next = { ...prev };
+      delete next[modelId];
+      return next;
+    });
+    removeTestStateKey(testKey);
+  };
+
+  // Fetch models helpers
+  const generateModelsUrl = (): string => {
+    if (isOAuthMode) return '';
+    const ollamaUrl = getApiUrlValue('ollama');
+    if (ollamaUrl) return 'https://ollama.com/api/tags';
+    const chatUrl = getApiUrlValue('chat');
+    if (chatUrl) {
+      return `${chatUrl.replace(/\/(?:chat\/completions|messages)\/?$/, '')}/models`;
+    }
+    const messagesUrl = getApiUrlValue('messages');
+    if (messagesUrl) {
+      return `${messagesUrl.replace(/\/(?:chat\/completions|messages)\/?$/, '')}/models`;
+    }
+    return '';
+  };
+
+  const handleOpenFetchModels = () => {
+    const defaultUrl = generateModelsUrl();
+    setModelsUrl(defaultUrl);
+    setFetchedModels([]);
+    setSelectedModelIds(new Set());
+    setFetchError(null);
+    setFetchWarning(null);
+    setIsFetchModelsModalOpen(true);
+  };
+
+  const handleFetchModels = async () => {
+    if (isOAuthMode) {
+      const oauthProvider = editingProvider.oauthProvider || (OAUTH_PROVIDERS[0]?.value ?? '');
+      // OAuth model lists are account-scoped; the account is the provider ID.
+      const accountId = editingProvider.id.trim() || undefined;
+      setIsFetchingModels(true);
+      setFetchError(null);
+      setFetchWarning(null);
+      try {
+        const { models, warning } = await api.getOAuthProviderModels(oauthProvider, accountId);
+        const sortedModels = [...models].sort((a, b) => a.id.localeCompare(b.id));
+        setFetchWarning(warning ?? null);
+        if (sortedModels.length === 0) {
+          setFetchError(`No models found for OAuth provider '${oauthProvider}'.`);
+          setFetchedModels([]);
+          setSelectedModelIds(new Set());
+          return;
+        }
+        setFetchedModels(sortedModels);
+        setSelectedModelIds(new Set());
+      } catch (error) {
+        setFetchError(error instanceof Error ? error.message : 'Failed to fetch models');
+        setFetchedModels([]);
+      } finally {
+        setIsFetchingModels(false);
+      }
+      return;
+    }
+    if (!modelsUrl) {
+      setFetchError('Please enter a URL');
+      return;
+    }
+    setIsFetchingModels(true);
+    setFetchError(null);
+    setFetchWarning(null);
+    try {
+      const data = await api.fetchProviderModels(modelsUrl, editingProvider.apiKey);
+      if (!data.data || !Array.isArray(data.data)) throw new Error('Invalid response format');
+      setFetchedModels(
+        [...data.data].sort((a: FetchedModel, b: FetchedModel) => a.id.localeCompare(b.id))
+      );
+      setSelectedModelIds(new Set());
+    } catch (error) {
+      setFetchError(error instanceof Error ? error.message : 'Failed to fetch models');
+      setFetchedModels([]);
+    } finally {
+      setIsFetchingModels(false);
+    }
+  };
+
+  const toggleModelSelection = (modelId: string) => {
+    setSelectedModelIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(modelId)) next.delete(modelId);
+      else next.add(modelId);
+      return next;
+    });
+  };
+
+  const selectAllFetchedModels = () => {
+    setSelectedModelIds(new Set(fetchedModels.map((model) => model.id)));
+  };
+
+  const clearSelectedModels = () => {
+    setSelectedModelIds(new Set());
+  };
+
+  const handleAddSelectedModels = () => {
+    const models = {
+      ...(typeof editingProvider.models === 'object' && !Array.isArray(editingProvider.models)
+        ? editingProvider.models
+        : {}),
+    };
+    // Codex is the only provider whose discovery reports image models, and
+    // `codex-images` is the only image protocol its dispatcher accepts. Anywhere
+    // else an upstream `type: "image"` carries no protocol we could name, so
+    // those entries keep the plain shape and the admin picks a type by hand.
+    const isCodexOAuthProvider =
+      isOAuthMode && editingProvider.oauthProvider === CODEX_OAUTH_PROVIDER;
+    fetchedModels.forEach((model) => {
+      if (selectedModelIds.has(model.id) && !models[model.id]) {
+        const pricing = { source: 'simple', input: 0, output: 0 };
+        // Image models cannot serve chat, so they are added as `image` with an
+        // image protocol rather than as a chat target.
+        models[model.id] =
+          isCodexOAuthProvider && model.type === 'image'
+            ? {
+                pricing,
+                type: 'image',
+                access_via: model.access_via?.length ? model.access_via : [CODEX_IMAGE_ACCESS],
+              }
+            : { pricing, access_via: [] };
+      }
+    });
+    setEditingProvider({ ...editingProvider, models });
+    setIsFetchModelsModalOpen(false);
+  };
+
+  const validateQuotaChecker = (): string | null => {
+    const quotaType = editingProvider.quotaChecker?.type;
+    const options = editingProvider.quotaChecker?.options || {};
+    if (!quotaType) return null;
+    if (quotaType === 'naga' && (!options.apiKey || !(options.apiKey as string).trim()))
+      return 'Provisioning API Key is required for Naga quota checker';
+    if (quotaType === 'minimax') {
+      if (!options.groupid || !(options.groupid as string).trim())
+        return 'Group ID is required for MiniMax quota checker';
+      if (!options.token || !(options.token as string).trim())
+        return '_token cookie value is required for MiniMax quota checker';
+    }
+    if (quotaType === 'wisdomgate' && (!options.session || !(options.session as string).trim()))
+      return 'Session cookie is required for Wisdom Gate quota checker';
+    if (quotaType === 'devpass' && (!options.session || !(options.session as string).trim()))
+      return 'Session cookie is required for DevPass quota checker';
+    if (quotaType === 'opencode-go') {
+      if (!options.workspaceId || !(options.workspaceId as string).trim())
+        return 'Workspace ID is required for OpenCode Go quota checker';
+      if (!options.authCookie || !(options.authCookie as string).trim())
+        return 'Auth cookie is required for OpenCode Go quota checker';
+    }
+    if (
+      quotaType === 'sakana' &&
+      (!options.sessionCookie || !(options.sessionCookie as string).trim())
+    )
+      return 'Session cookie is required for Sakana quota checker';
+    return null;
+  };
+
+  const getQuotaDisplay = (provider: Provider): React.ReactNode => {
+    if (!provider.quotaChecker?.enabled) return null;
+    if (quotasLoading) return <span className="text-text-secondary text-xs">—</span>;
+    const handleQuotaClick = (e: React.MouseEvent) => {
+      e.stopPropagation();
+      navigate('/quotas');
+    };
+    const quota = quotas.find((q) => q.checkerId === provider.id);
+    if (!quota) return null;
+    // GET /v0/management/quotas reports success:false with no error before
+    // the first snapshot exists — only badge an actual check failure.
+    if (!quota.success && quota.error) {
+      return (
+        <Badge
+          status="error"
+          noDot
+          className="cursor-pointer px-2 py-0.5 text-[10px]"
+          onClick={handleQuotaClick}
+          title={quota.error}
+        >
+          Quota error
+        </Badge>
+      );
+    }
+    if (!quota.meters?.length) return null;
+
+    const badges: React.ReactNode[] = [];
+
+    // Balance pill
+    const balanceMeter = quota.meters.find(
+      (m) => m.kind === 'balance' && m.remaining !== undefined
+    );
+    if (balanceMeter && balanceMeter.remaining !== undefined) {
+      badges.push(
+        <Badge
+          key="balance"
+          status="neutral"
+          className="bg-bg-subtle border-border text-text-secondary cursor-pointer border px-2 py-0.5 text-[10px] [&_.connection-dot]:hidden"
+          onClick={handleQuotaClick}
+        >
+          {formatMeterValue(balanceMeter.remaining, balanceMeter.unit, false, {
+            currency,
+            rate,
+            symbol,
+          })}
+        </Badge>
+      );
+    }
+
+    // Allowance pill
+    const allowances = quota.meters.filter((m) => m.kind === 'allowance');
+    const primary = allowances.reduce<(typeof allowances)[0] | undefined>((worst, m) => {
+      if (!worst) return m;
+      const wu = typeof worst.utilizationPercent === 'number' ? worst.utilizationPercent : 0;
+      const mu = typeof m.utilizationPercent === 'number' ? m.utilizationPercent : 0;
+      return mu > wu ? m : worst;
+    }, undefined);
+    if (primary && typeof primary.utilizationPercent === 'number') {
+      const pct = Math.round(primary.utilizationPercent);
+      const status = pct >= 90 ? 'error' : pct >= 70 ? 'warning' : 'connected';
+      badges.push(
+        <Badge
+          key="allowance"
+          status={status}
+          className="cursor-pointer px-2 py-0.5 text-[10px] [&_.connection-dot]:hidden"
+          onClick={handleQuotaClick}
+        >
+          {pct}%
+        </Badge>
+      );
+    }
+
+    if (!badges.length) return null;
+    if (badges.length === 1) return badges[0];
+    return <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>{badges}</div>;
+  };
+
+  const sortedProviders = [...providers].sort((a, b) => a.id.localeCompare(b.id));
+  const quotaValidationError = validateQuotaChecker();
+
+  return {
+    // State
+    providers,
+    sortedProviders,
+    isModalOpen,
+    setIsModalOpen,
+    editingProvider,
+    setEditingProvider,
+    setPresetSelected,
+    originalId,
+    isSaving,
+    quotaCheckerTypes,
+    customCheckerIds,
+    quotas,
+    quotasLoading,
+    oauthProvidersStatus,
+    reloadOAuthProviders,
+    oauthSessionId,
+    oauthSession,
+    oauthPromptValue,
+    setOauthPromptValue,
+    oauthManualCode,
+    setOauthManualCode,
+    oauthSelectValue,
+    setOauthSelectValue,
+    oauthError,
+    oauthBusy,
+    oauthCredentialReady,
+    oauthCredentialChecking,
+    oauthCredentialStatus,
+    oauthStatus,
+    oauthIsTerminal,
+    oauthStatusLabel,
+    isOAuthMode,
+    oauthCheckerType,
+    selectableQuotaCheckerTypes,
+    selectedQuotaCheckerType,
+    quotaValidationError,
+    // Accordion
+    isModelsOpen,
+    setIsModelsOpen,
+    openModelIdx,
+    setOpenModelIdx,
+    isApiBaseUrlsOpen,
+    setIsApiBaseUrlsOpen,
+    isHeadersOpen,
+    setIsHeadersOpen,
+    isExtraBodyOpen,
+    setIsExtraBodyOpen,
+    isModelExtraBodyOpen,
+    setIsModelExtraBodyOpen,
+    isAdvancedOpen,
+    setIsAdvancedOpen,
+    // Fetch models
+    isFetchModelsModalOpen,
+    setIsFetchModelsModalOpen,
+    modelsUrl,
+    setModelsUrl,
+    isFetchingModels,
+    fetchedModels,
+    selectedModelIds,
+    setSelectedModelIds,
+    fetchError,
+    fetchWarning,
+    // Delete
+    deleteModalProvider,
+    setDeleteModalProvider,
+    deleteModalLoading,
+    affectedAliases,
+    // Test
+    testStates,
+    dismissTestMessage,
+    // Handlers
+    handleEdit,
+    handleAddNew,
+    handleSave,
+    handleDelete,
+    handleToggleEnabled,
+    handleTestModel,
+    openDeleteModal,
+    // OAuth
+    handleStartOAuth,
+    handleSubmitPrompt,
+    handleSubmitManualCode,
+    handleSubmitSelect,
+    handleCancelOAuth,
+    handleDeleteOAuthCredential,
+    // API URLs
+    getApiBaseUrlMap,
+    getApiUrlValue,
+    addApiBaseUrlEntry,
+    updateApiBaseUrlEntry,
+    removeApiBaseUrlEntry,
+    // KV
+    addKV,
+    updateKV,
+    removeKV,
+    // Model KV
+    addModelKV,
+    updateModelKV,
+    removeModelKV,
+    // Models
+    addModel,
+    updateModelId,
+    updateModelConfig,
+    removeModel,
+    // Fetch
+    handleOpenFetchModels,
+    handleFetchModels,
+    toggleModelSelection,
+    selectAllFetchedModels,
+    clearSelectedModels,
+    handleAddSelectedModels,
+    // Quota
+    getQuotaDisplay,
+    // Constants
+    KNOWN_APIS,
+    OAUTH_PROVIDERS,
+  };
+}
