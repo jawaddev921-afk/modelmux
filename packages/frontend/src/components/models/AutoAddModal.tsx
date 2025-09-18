@@ -1,0 +1,266 @@
+import { useEffect, useRef, useState } from 'react';
+
+import type { AliasTargetGroup, Model, Provider } from '../../lib/api';
+import { dedupeModels } from '../../lib/modelOptions';
+import { Button } from '../ui/Button';
+import { Input } from '../ui/Input';
+import { Modal } from '../ui/Modal';
+
+interface Props {
+  isOpen: boolean;
+  onClose: () => void;
+  providers: Provider[];
+  availableModels: Model[];
+  targetGroups: AliasTargetGroup[];
+  onAddTargets: (targets: Array<{ provider: string; model: string }>) => void;
+  preFillQuery?: string;
+}
+
+const getMatchingModels = (query: string, availableModels: Model[], providers: Provider[]) => {
+  const searchTerm = query.trim();
+  if (!searchTerm) return [];
+
+  const searchLower = searchTerm.toLowerCase();
+  const matches: Array<{ model: Model; provider: Provider }> = [];
+  dedupeModels(availableModels).forEach((model) => {
+    const provider = providers.find((p) => p.id === model.providerId);
+    if (
+      provider &&
+      (model.name.toLowerCase().includes(searchLower) ||
+        provider.name.toLowerCase().includes(searchLower))
+    ) {
+      matches.push({ model, provider: { ...provider } });
+    }
+  });
+  return matches;
+};
+
+export function AutoAddModal({
+  isOpen,
+  onClose,
+  providers,
+  availableModels,
+  targetGroups,
+  onAddTargets,
+  preFillQuery = '',
+}: Props) {
+  const [substring, setSubstring] = useState(preFillQuery);
+  const [filteredModels, setFilteredModels] = useState<Array<{ model: Model; provider: Provider }>>(
+    []
+  );
+  const [selectedModels, setSelectedModels] = useState<Set<string>>(new Set());
+  const wasOpenRef = useRef(false);
+  const availableModelsRef = useRef(availableModels);
+  const providersRef = useRef(providers);
+
+  availableModelsRef.current = availableModels;
+  providersRef.current = providers;
+
+  useEffect(() => {
+    const wasOpen = wasOpenRef.current;
+    wasOpenRef.current = isOpen;
+    if (!isOpen || wasOpen) return;
+
+    setSubstring(preFillQuery);
+    setSelectedModels(new Set());
+    setFilteredModels(
+      getMatchingModels(preFillQuery, availableModelsRef.current, providersRef.current)
+    );
+  }, [isOpen, preFillQuery]);
+
+  const handleSearchModels = (query?: string) => {
+    const searchTerm = query !== undefined ? query : substring;
+    setFilteredModels(getMatchingModels(searchTerm, availableModels, providers));
+  };
+
+  const handleToggleModelSelection = (modelId: string, providerId: string) => {
+    const key = `${providerId}|${modelId}`;
+    setSelectedModels((prev) => {
+      const newSelection = new Set(prev);
+      if (newSelection.has(key)) {
+        newSelection.delete(key);
+      } else {
+        newSelection.add(key);
+      }
+      return newSelection;
+    });
+  };
+
+  const handleAddSelectedModels = () => {
+    const targets: Array<{ provider: string; model: string }> = [];
+    selectedModels.forEach((key) => {
+      const separatorIndex = key.indexOf('|');
+      const providerId = key.substring(0, separatorIndex);
+      const modelId = key.substring(separatorIndex + 1);
+      targets.push({ provider: providerId, model: modelId });
+    });
+    onAddTargets(targets);
+    setSubstring('');
+    setFilteredModels([]);
+    setSelectedModels(new Set());
+  };
+
+  const existingTargets = targetGroups.flatMap((group) => group.targets);
+
+  return (
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title="Auto Add Targets"
+      size="lg"
+      footer={
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px' }}>
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={handleAddSelectedModels} disabled={selectedModels.size === 0}>
+            Add {selectedModels.size} Target{selectedModels.size !== 1 ? 's' : ''}
+          </Button>
+        </div>
+      }
+    >
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <div className="min-w-0 flex-1">
+            <Input
+              placeholder="Search models (e.g. 'gpt-4', 'claude')"
+              value={substring}
+              onChange={(e) => setSubstring(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleSearchModels()}
+            />
+          </div>
+          <Button onClick={() => handleSearchModels()} className="w-full sm:w-auto">
+            Search
+          </Button>
+        </div>
+
+        {filteredModels.length > 0 ? (
+          <div
+            style={{
+              maxHeight: '400px',
+              overflowY: 'auto',
+              overflowX: 'auto',
+              border: '1px solid var(--color-border-glass)',
+              borderRadius: 'var(--radius-sm)',
+            }}
+          >
+            <table className="font-body w-full border-collapse text-[13px]">
+              <thead
+                style={{
+                  position: 'sticky',
+                  top: 0,
+                  backgroundColor: 'var(--color-bg-hover)',
+                  zIndex: 10,
+                }}
+              >
+                <tr>
+                  <th
+                    className="text-text-secondary px-4 py-3 text-left text-[11px] font-semibold tracking-wider uppercase"
+                    style={{ width: '40px' }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={
+                        filteredModels.length > 0 &&
+                        filteredModels.every(
+                          (m) =>
+                            selectedModels.has(`${m.provider.id}|${m.model.id}`) ||
+                            existingTargets.some(
+                              (t: any) => t.provider === m.provider.id && t.model === m.model.id
+                            )
+                        )
+                      }
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setSelectedModels((prev) => {
+                            const newSelection = new Set(prev);
+                            filteredModels.forEach((m) => {
+                              const key = `${m.provider.id}|${m.model.id}`;
+                              if (
+                                !existingTargets.some(
+                                  (t: any) => t.provider === m.provider.id && t.model === m.model.id
+                                )
+                              ) {
+                                newSelection.add(key);
+                              }
+                            });
+                            return newSelection;
+                          });
+                        } else {
+                          setSelectedModels((prev) => {
+                            const newSelection = new Set(prev);
+                            filteredModels.forEach((m) => {
+                              newSelection.delete(`${m.provider.id}|${m.model.id}`);
+                            });
+                            return newSelection;
+                          });
+                        }
+                      }}
+                    />
+                  </th>
+                  <th className="text-text-secondary px-4 py-3 text-left text-[11px] font-semibold tracking-wider uppercase">
+                    Provider
+                  </th>
+                  <th className="text-text-secondary px-4 py-3 text-left text-[11px] font-semibold tracking-wider uppercase">
+                    Model
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredModels.map(({ model, provider }) => {
+                  const key = `${provider.id}|${model.id}`;
+                  const alreadyExists = existingTargets.some(
+                    (t: any) => t.provider === provider.id && t.model === model.id
+                  );
+                  const isSelected = selectedModels.has(key);
+                  const isDisabled = alreadyExists;
+
+                  return (
+                    <tr
+                      key={key}
+                      className="hover:bg-bg-hover"
+                      style={{ opacity: isDisabled ? 0.5 : 1 }}
+                    >
+                      <td className="text-text px-4 py-3 text-left">
+                        <input
+                          type="checkbox"
+                          checked={isSelected || alreadyExists}
+                          disabled={isDisabled}
+                          onChange={() => handleToggleModelSelection(model.id, provider.id)}
+                        />
+                      </td>
+                      <td className="text-text px-4 py-3 text-left">{provider.name}</td>
+                      <td className="text-text px-4 py-3 text-left">
+                        {model.name}
+                        {alreadyExists && (
+                          <span
+                            style={{
+                              marginLeft: '8px',
+                              fontSize: '11px',
+                              color: 'var(--color-text-secondary)',
+                              fontStyle: 'italic',
+                            }}
+                          >
+                            (already added)
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : substring ? (
+          <div className="text-text-muted py-8 text-center text-sm italic">
+            No models found matching &quot;{substring}&quot;
+          </div>
+        ) : (
+          <div className="text-text-muted py-8 text-center text-sm italic">
+            Enter a search term to find models
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
