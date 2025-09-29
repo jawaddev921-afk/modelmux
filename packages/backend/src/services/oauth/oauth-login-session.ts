@@ -1,0 +1,461 @@
+import type { OAuthCredentials, ProviderAuthInteraction } from '@earendil-works/pi-ai';
+
+import { OAuthAuthManager } from './oauth-auth-manager';
+import {
+  getOAuthProviderAuth,
+  listOAuthProviders,
+  type OAuthProviderDescriptor,
+  type OAuthProviderId,
+} from './oauth-providers';
+
+export type OAuthSessionStatus =
+  | 'in_progress'
+  | 'awaiting_auth'
+  | 'awaiting_prompt'
+  | 'awaiting_manual_code'
+  | 'awaiting_select'
+  | 'success'
+  | 'error'
+  | 'cancelled';
+
+export type OAuthAuthInfo = {
+  url: string;
+  instructions?: string;
+};
+
+export type OAuthPrompt = {
+  message: string;
+  placeholder?: string;
+  allowEmpty?: boolean;
+};
+
+/** Options offered by a `select` prompt (e.g. Codex browser vs device code). */
+export type OAuthSelectOption = {
+  id: string;
+  label: string;
+  description?: string;
+};
+
+export type OAuthSelect = {
+  message: string;
+  options: OAuthSelectOption[];
+};
+
+/** Copy/label for the dedicated manual-code input, supplied by the provider. */
+export type OAuthManualCode = {
+  message: string;
+  placeholder?: string;
+};
+
+export type OAuthSession = {
+  id: string;
+  providerId: OAuthProviderId;
+  accountId: string;
+  status: OAuthSessionStatus;
+  authInfo?: OAuthAuthInfo;
+  prompt?: OAuthPrompt;
+  select?: OAuthSelect;
+  manualCode?: OAuthManualCode;
+  progress: string[];
+  error?: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+type SessionInternal = OAuthSession & {
+  resolvePrompt?: (value: string) => void;
+  rejectPrompt?: (error: Error) => void;
+  resolveManualCode?: (value: string) => void;
+  rejectManualCode?: (error: Error) => void;
+  resolveSelect?: (value: string) => void;
+  rejectSelect?: (error: Error) => void;
+  abortController: AbortController;
+  completion: Promise<void>;
+  expiresAt: number;
+  savingCredentials: boolean;
+};
+
+type ProviderResolver = (id: OAuthProviderId) => OAuthProviderDescriptor | undefined;
+
+const DEFAULT_SESSION_TTL_MS = 20 * 60 * 1000;
+
+const ACTIVE_STATUSES: ReadonlySet<OAuthSessionStatus> = new Set([
+  'in_progress',
+  'awaiting_auth',
+  'awaiting_prompt',
+  'awaiting_manual_code',
+  'awaiting_select',
+]);
+
+const createSessionId = (): string => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+};
+
+const createDeferred = () => {
+  let resolve!: (value: string) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<string>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+};
+
+export class OAuthLoginSessionManager {
+  private sessions = new Map<string, SessionInternal>();
+  private providerResolver: ProviderResolver;
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(providerResolver: ProviderResolver = getOAuthProviderAuth) {
+    this.providerResolver = providerResolver;
+    this.startCleanup();
+  }
+
+  static instance: OAuthLoginSessionManager | undefined;
+
+  static getInstance(): OAuthLoginSessionManager {
+    if (!this.instance) {
+      this.instance = new OAuthLoginSessionManager();
+    }
+    return this.instance;
+  }
+
+  dispose(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+    for (const session of this.sessions.values()) {
+      this.releaseSession(session, 'Login manager disposed');
+    }
+    this.sessions.clear();
+  }
+
+  listProviders(): OAuthProviderDescriptor[] {
+    return listOAuthProviders();
+  }
+
+  getSession(sessionId: string): OAuthSession | undefined {
+    this.cleanupExpired();
+    const session = this.sessions.get(sessionId);
+    return session ? this.stripInternal(session) : undefined;
+  }
+
+  async createSession(providerId: OAuthProviderId, accountId: string): Promise<OAuthSession> {
+    this.cleanupExpired();
+    if (!accountId?.trim()) {
+      throw new Error('accountId is required');
+    }
+
+    const provider = this.providerResolver(providerId);
+    if (!provider) {
+      throw new Error(`Unknown OAuth provider: ${providerId}`);
+    }
+
+    // Callback-server providers bind a fixed local port during login, so only
+    // one login per provider can be in flight at a time. A prior session may be
+    // orphaned (its id lost to a reload, or the browser is on another machine),
+    // leaving no way to cancel it — so supersede it here: cancel the stale login
+    // and wait for its callback server to release the port before continuing.
+    if (provider.usesCallbackServer) {
+      const active = this.findActiveSession(providerId);
+      if (active) {
+        if (!active.savingCredentials) {
+          active.status = 'cancelled';
+          active.error = 'Superseded by a new login';
+          this.releaseSession(active, 'Superseded by a new login');
+          this.touch(active);
+        }
+        // A completed OAuth flow cannot cancel persistence. Wait for its real
+        // outcome before starting the replacement login.
+        await active.completion;
+      }
+    }
+
+    const now = Date.now();
+    const sessionId = createSessionId();
+    const abortController = new AbortController();
+
+    const session: SessionInternal = {
+      id: sessionId,
+      providerId,
+      accountId,
+      status: 'in_progress',
+      progress: [],
+      createdAt: now,
+      updatedAt: now,
+      abortController,
+      completion: Promise.resolve(),
+      expiresAt: now + DEFAULT_SESSION_TTL_MS,
+      savingCredentials: false,
+    };
+
+    session.completion = this.runLogin(provider, session).catch(() => undefined);
+    this.sessions.set(sessionId, session);
+    return this.stripInternal(session);
+  }
+
+  async submitPrompt(sessionId: string, value: string): Promise<OAuthSession> {
+    const session = this.getInternal(sessionId);
+    if (!session.resolvePrompt) {
+      throw new Error('No prompt is awaiting input');
+    }
+    session.resolvePrompt(value);
+    session.resolvePrompt = undefined;
+    session.rejectPrompt = undefined;
+    session.prompt = undefined;
+    if (session.status === 'awaiting_prompt') {
+      session.status = 'in_progress';
+    }
+    this.touch(session);
+    return this.stripInternal(session);
+  }
+
+  async submitManualCode(sessionId: string, value: string): Promise<OAuthSession> {
+    const session = this.getInternal(sessionId);
+    if (!session.resolveManualCode) {
+      throw new Error('No manual code input is awaiting input');
+    }
+    session.resolveManualCode(value);
+    session.resolveManualCode = undefined;
+    session.rejectManualCode = undefined;
+    session.manualCode = undefined;
+    if (session.status === 'awaiting_manual_code') {
+      session.status = 'in_progress';
+    }
+    this.touch(session);
+    return this.stripInternal(session);
+  }
+
+  async submitSelect(sessionId: string, value: string): Promise<OAuthSession> {
+    const session = this.getInternal(sessionId);
+    if (!session.resolveSelect) {
+      throw new Error('No selection is awaiting input');
+    }
+    if (!session.select?.options.some((option) => option.id === value)) {
+      throw new Error(`Unknown option: ${value}`);
+    }
+    session.resolveSelect(value);
+    session.resolveSelect = undefined;
+    session.rejectSelect = undefined;
+    session.select = undefined;
+    if (session.status === 'awaiting_select') {
+      session.status = 'in_progress';
+    }
+    this.touch(session);
+    return this.stripInternal(session);
+  }
+
+  async cancel(sessionId: string): Promise<OAuthSession> {
+    const session = this.getInternal(sessionId);
+    if (session.status === 'success' || session.status === 'error') {
+      return this.stripInternal(session);
+    }
+    if (session.savingCredentials) {
+      // Once persistence starts it cannot be cancelled. Return the committed
+      // outcome rather than claiming cancellation while a credential is saved.
+      await session.completion;
+      return this.stripInternal(session);
+    }
+    session.status = 'cancelled';
+    session.error = 'Login cancelled';
+    this.releaseSession(session, 'Login cancelled');
+    this.touch(session);
+    return this.stripInternal(session);
+  }
+
+  /**
+   * Abort the underlying login and reject any pending prompt. Rejecting the
+   * prompt is what makes pi-ai's login promise settle and close its callback
+   * server (which binds a fixed local port, e.g. Anthropic's 53692). Aborting
+   * the signal alone does not, so callers that drop a session (cancel, expiry,
+   * dispose) must go through here to avoid leaking the port.
+   */
+  private releaseSession(session: SessionInternal, reason: string): void {
+    session.abortController.abort();
+    session.rejectPrompt?.(new Error(reason));
+    session.rejectManualCode?.(new Error(reason));
+    session.rejectSelect?.(new Error(reason));
+    session.resolvePrompt = undefined;
+    session.rejectPrompt = undefined;
+    session.resolveManualCode = undefined;
+    session.rejectManualCode = undefined;
+    session.resolveSelect = undefined;
+    session.rejectSelect = undefined;
+  }
+
+  private findActiveSession(providerId: OAuthProviderId): SessionInternal | undefined {
+    for (const session of this.sessions.values()) {
+      if (session.providerId === providerId && ACTIVE_STATUSES.has(session.status)) {
+        return session;
+      }
+    }
+    return undefined;
+  }
+
+  private getInternal(sessionId: string): SessionInternal {
+    this.cleanupExpired();
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new Error('OAuth session not found');
+    }
+    return session;
+  }
+
+  private stripInternal(session: SessionInternal): OAuthSession {
+    return {
+      id: session.id,
+      providerId: session.providerId,
+      accountId: session.accountId,
+      status: session.status,
+      authInfo: session.authInfo,
+      prompt: session.prompt,
+      select: session.select,
+      manualCode: session.manualCode,
+      progress: [...session.progress],
+      error: session.error,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+    };
+  }
+
+  private touch(session: SessionInternal): void {
+    session.updatedAt = Date.now();
+  }
+
+  private async runLogin(
+    provider: OAuthProviderDescriptor,
+    session: SessionInternal
+  ): Promise<void> {
+    const authManager = OAuthAuthManager.getInstance();
+
+    const awaitUserInput = (manual: boolean, message: string, placeholder?: string) => {
+      // Manual-code entry renders as the UI's dedicated redirect-URL input
+      // (driven by the awaiting_manual_code status), not the generic prompt
+      // input — keep session.prompt unset so only one input is shown.
+      //
+      // allowEmpty: pi-ai 0.80.9's AuthPrompt dropped the old allowEmpty
+      // flag; blank input is passed through and each provider validates it
+      // (e.g. Copilot treats a blank GHE domain as github.com), so the UI
+      // must not block empty submission.
+      session.prompt = manual ? undefined : { message, placeholder, allowEmpty: true };
+      // Manual-code entry renders as its own input, so carry the provider's
+      // message/placeholder for the UI to show (Anthropic wants `code#state`,
+      // Codex wants the full redirect URL).
+      session.manualCode = manual ? { message, placeholder } : undefined;
+      session.status = manual ? 'awaiting_manual_code' : 'awaiting_prompt';
+      this.touch(session);
+      const deferred = createDeferred();
+      if (manual) {
+        session.resolveManualCode = deferred.resolve;
+        session.rejectManualCode = deferred.reject;
+      } else {
+        session.resolvePrompt = deferred.resolve;
+        session.rejectPrompt = deferred.reject;
+      }
+      return deferred.promise;
+    };
+
+    const interaction: ProviderAuthInteraction = {
+      signal: session.abortController.signal,
+      notify: (event) => {
+        switch (event.type) {
+          case 'auth_url':
+            session.authInfo = { url: event.url, instructions: event.instructions };
+            session.status = 'awaiting_auth';
+            break;
+          case 'device_code':
+            session.authInfo = {
+              url: event.verificationUri,
+              instructions: `Enter code: ${event.userCode}`,
+            };
+            session.status = 'awaiting_auth';
+            break;
+          case 'progress':
+          case 'info':
+            session.progress.push(event.message);
+            if (session.progress.length > 100) {
+              session.progress.shift();
+            }
+            break;
+        }
+        this.touch(session);
+      },
+      prompt: (prompt) => {
+        // Select prompts (e.g. Codex browser vs device code) surface as a
+        // chooser so the user can pick the headless method when the browser
+        // cannot reach ModelMux. Other prompt types use the text/manual-code
+        // inputs.
+        if (prompt.type === 'select') {
+          if (prompt.options.length === 0) {
+            return Promise.reject(new Error('Login cancelled: no options to select'));
+          }
+          session.select = {
+            message: prompt.message,
+            options: prompt.options.map((option) => ({
+              id: option.id,
+              label: option.label,
+              ...(option.description ? { description: option.description } : {}),
+            })),
+          };
+          session.status = 'awaiting_select';
+          this.touch(session);
+          const deferred = createDeferred();
+          session.resolveSelect = deferred.resolve;
+          session.rejectSelect = deferred.reject;
+          return deferred.promise;
+        }
+        return awaitUserInput(prompt.type === 'manual_code', prompt.message, prompt.placeholder);
+      },
+    };
+
+    try {
+      const credentials: OAuthCredentials = await provider.oauth.login(interaction);
+      if (session.status === 'cancelled') return;
+      session.savingCredentials = true;
+      try {
+        await authManager.setCredentials(session.providerId, session.accountId, credentials);
+      } finally {
+        session.savingCredentials = false;
+      }
+      session.status = 'success';
+      session.error = undefined;
+      session.prompt = undefined;
+      session.select = undefined;
+      session.manualCode = undefined;
+      session.resolvePrompt = undefined;
+      session.rejectPrompt = undefined;
+      session.resolveManualCode = undefined;
+      session.rejectManualCode = undefined;
+      session.resolveSelect = undefined;
+      session.rejectSelect = undefined;
+      this.touch(session);
+    } catch (error) {
+      if (session.status !== 'cancelled') {
+        session.status = 'error';
+        session.error = error instanceof Error ? error.message : String(error);
+        session.select = undefined;
+        session.manualCode = undefined;
+        this.touch(session);
+      }
+    }
+  }
+
+  private startCleanup(): void {
+    if (this.cleanupTimer) return;
+    this.cleanupTimer = setInterval(() => this.cleanupExpired(), 60 * 1000);
+  }
+
+  private cleanupExpired(): void {
+    const now = Date.now();
+    for (const [id, session] of this.sessions.entries()) {
+      if (session.expiresAt <= now) {
+        this.releaseSession(session, 'OAuth login session expired');
+        this.sessions.delete(id);
+      }
+    }
+  }
+}
