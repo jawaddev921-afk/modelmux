@@ -1,0 +1,247 @@
+import { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+
+import { ConfigService } from '../../services/configuration/config-service';
+import { OAuthAuthManager } from '../../services/oauth/oauth-auth-manager';
+import { OAuthLoginSessionManager } from '../../services/oauth/oauth-login-session';
+import type { OAuthProvider, OAuthProviderId } from '../../services/oauth/oauth-providers';
+import {
+  getOAuthProviderModels,
+  listCodexOAuthModels,
+  listMuseOAuthModels,
+} from '../../services/providers/provider-model-discovery';
+
+const startSessionSchema = z.object({
+  providerId: z.string().min(1),
+  accountId: z.string().min(1),
+});
+
+const deleteCredentialsSchema = z.object({
+  providerId: z.string().min(1),
+  accountId: z.string().min(1),
+});
+
+const inputSchema = z.object({
+  value: z.string(),
+});
+
+const credentialStatusQuerySchema = z.object({
+  providerId: z.string().min(1),
+  accountId: z.string().min(1),
+});
+
+const getModelsQuerySchema = z.object({
+  providerId: z.string().min(1),
+  // Which OAuth account to ask. Only Codex and Muse Code live discovery use
+  // it; a blank value means "the provider's default account".
+  accountId: z.string().optional(),
+});
+
+const toProviderResponse = (provider: {
+  id: string;
+  name: string;
+  usesCallbackServer?: boolean;
+}) => ({
+  id: provider.id,
+  name: provider.name,
+  usesCallbackServer: !!provider.usesCallbackServer,
+});
+
+export async function registerOAuthRoutes(
+  fastify: FastifyInstance,
+  sessionManager: OAuthLoginSessionManager = OAuthLoginSessionManager.getInstance()
+) {
+  fastify.get('/v0/management/oauth/providers', async (_request, reply) => {
+    const providers = sessionManager.listProviders().map(toProviderResponse);
+    return reply.send({ data: providers, total: providers.length });
+  });
+
+  fastify.post('/v0/management/oauth/sessions', async (request, reply) => {
+    const parsed = startSessionSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Invalid request body', details: parsed.error.issues });
+    }
+
+    try {
+      const session = await sessionManager.createSession(
+        parsed.data.providerId as OAuthProviderId,
+        parsed.data.accountId
+      );
+      return reply.send({ data: session });
+    } catch (error) {
+      return reply
+        .code(400)
+        .send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  fastify.delete('/v0/management/oauth/credentials', async (request, reply) => {
+    const parsed = deleteCredentialsSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Invalid request body', details: parsed.error.issues });
+    }
+
+    const authManager = OAuthAuthManager.getInstance();
+    let deleted = false;
+    try {
+      deleted = await authManager.deleteCredentials(
+        parsed.data.providerId as OAuthProvider,
+        parsed.data.accountId
+      );
+    } catch (error) {
+      return reply
+        .code(500)
+        .send({ error: error instanceof Error ? error.message : String(error) });
+    }
+
+    if (!deleted) {
+      return reply.code(404).send({ error: 'OAuth credentials not found' });
+    }
+
+    return reply.send({ data: { deleted: true } });
+  });
+
+  fastify.get('/v0/management/oauth/credentials/status', async (request, reply) => {
+    const parsed = credentialStatusQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      return reply
+        .code(400)
+        .send({ error: 'Invalid query parameters', details: parsed.error.issues });
+    }
+
+    const authManager = OAuthAuthManager.getInstance();
+    const providerId = parsed.data.providerId as OAuthProvider;
+    const accountId = parsed.data.accountId.trim();
+    const ready = authManager.hasProvider(providerId, accountId);
+    if (!ready) {
+      return reply.send({ data: { ready } });
+    }
+
+    // Credential age, so a stale login is visible on the provider form. The
+    // in-memory expiry is authoritative; the row may still be mid-write right
+    // after a login, in which case only the expiry is known.
+    const timestamps = await ConfigService.getInstance()
+      .getOAuthCredentialTimestamps(providerId, accountId)
+      .catch(() => null);
+    const expiresAt = authManager.getCredentials(providerId, accountId)?.expires;
+    return reply.send({
+      data: {
+        ready,
+        ...(timestamps?.createdAt ? { connectedAt: timestamps.createdAt } : {}),
+        ...(timestamps?.updatedAt ? { refreshedAt: timestamps.updatedAt } : {}),
+        ...(typeof expiresAt === 'number' && expiresAt > 0 ? { expiresAt } : {}),
+      },
+    });
+  });
+
+  fastify.get('/v0/management/oauth/sessions/:id', async (request, reply) => {
+    const sessionId = (request.params as { id: string }).id;
+    const session = sessionManager.getSession(sessionId);
+    if (!session) {
+      return reply.code(404).send({ error: 'OAuth session not found' });
+    }
+    return reply.send({ data: session });
+  });
+
+  fastify.post('/v0/management/oauth/sessions/:id/prompt', async (request, reply) => {
+    const sessionId = (request.params as { id: string }).id;
+    const parsed = inputSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Invalid request body', details: parsed.error.issues });
+    }
+
+    try {
+      const session = await sessionManager.submitPrompt(sessionId, parsed.data.value);
+      return reply.send({ data: session });
+    } catch (error) {
+      return reply
+        .code(400)
+        .send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  fastify.post('/v0/management/oauth/sessions/:id/manual-code', async (request, reply) => {
+    const sessionId = (request.params as { id: string }).id;
+    const parsed = inputSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Invalid request body', details: parsed.error.issues });
+    }
+
+    try {
+      const session = await sessionManager.submitManualCode(sessionId, parsed.data.value);
+      return reply.send({ data: session });
+    } catch (error) {
+      return reply
+        .code(400)
+        .send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  fastify.post('/v0/management/oauth/sessions/:id/select', async (request, reply) => {
+    const sessionId = (request.params as { id: string }).id;
+    const parsed = inputSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Invalid request body', details: parsed.error.issues });
+    }
+
+    try {
+      const session = await sessionManager.submitSelect(sessionId, parsed.data.value);
+      return reply.send({ data: session });
+    } catch (error) {
+      return reply
+        .code(400)
+        .send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  fastify.post('/v0/management/oauth/sessions/:id/cancel', async (request, reply) => {
+    const sessionId = (request.params as { id: string }).id;
+    try {
+      const session = await sessionManager.cancel(sessionId);
+      return reply.send({ data: session });
+    } catch (error) {
+      return reply
+        .code(400)
+        .send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  fastify.get('/v0/management/oauth/models', async (request, reply) => {
+    const parsed = getModelsQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      return reply
+        .code(400)
+        .send({ error: 'Invalid query parameters', details: parsed.error.issues });
+    }
+
+    try {
+      // Codex and Muse Code are the OAuth providers whose real model lists
+      // are account-scoped, so they are fetched live (with a catalog
+      // fallback + warning).
+      if (parsed.data.providerId === 'openai-codex') {
+        const discovery = await listCodexOAuthModels(parsed.data.accountId || undefined);
+        return reply.send({
+          data: discovery.models,
+          source: discovery.source,
+          ...(discovery.warning ? { warning: discovery.warning } : {}),
+        });
+      }
+
+      if (parsed.data.providerId === 'meta') {
+        const discovery = await listMuseOAuthModels(parsed.data.accountId || undefined);
+        return reply.send({
+          data: discovery.models,
+          source: discovery.source,
+          ...(discovery.warning ? { warning: discovery.warning } : {}),
+        });
+      }
+
+      const modelList = getOAuthProviderModels(parsed.data.providerId);
+      return reply.send({ data: modelList, source: 'catalog' });
+    } catch (error) {
+      return reply
+        .code(400)
+        .send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+}
