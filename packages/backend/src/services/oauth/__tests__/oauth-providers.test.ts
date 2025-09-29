@@ -1,0 +1,66 @@
+import { describe, expect, it } from 'bun:test';
+
+import {
+  getOAuthProviderAuth,
+  isKnownOAuthProviderId,
+  listOAuthProviders,
+} from '../oauth-providers';
+
+// ModelMux exposes every OAuth-capable provider pi-ai ships except 'radius',
+// which is a configurable gateway factory rather than a fixed identity
+// provider (see oauth-providers.ts doc comment).
+describe('oauth-providers facade', () => {
+  it('recognizes every OAuth-capable pi-ai provider except radius', () => {
+    for (const id of [
+      'anthropic',
+      'openai-codex',
+      'github-copilot',
+      'xai',
+      'kimi-coding',
+      'openrouter',
+      'meta',
+    ]) {
+      expect(isKnownOAuthProviderId(id)).toBe(true);
+      expect(getOAuthProviderAuth(id)).toBeDefined();
+    }
+  });
+
+  it('uses the ModelMux copy-code login for anthropic (no callback server)', () => {
+    const descriptor = getOAuthProviderAuth('anthropic');
+    expect(descriptor?.usesCallbackServer).toBe(false);
+    expect(descriptor?.oauth.login).toBeTypeOf('function');
+  });
+
+  it('recognizes pi-ai\u2019s native meta (Muse subscription) provider', () => {
+    expect(isKnownOAuthProviderId('meta')).toBe(true);
+    const descriptor = getOAuthProviderAuth('meta');
+    expect(descriptor?.id).toBe('meta');
+    expect(descriptor?.usesCallbackServer).toBe(false);
+    expect(listOAuthProviders().some((p) => p.id === 'meta')).toBe(true);
+  });
+
+  it('blocks radius', () => {
+    expect(isKnownOAuthProviderId('radius')).toBe(false);
+    expect(getOAuthProviderAuth('radius')).toBeUndefined();
+  });
+
+  it('rejects unknown/non-OAuth provider ids', () => {
+    expect(isKnownOAuthProviderId('not-a-real-provider')).toBe(false);
+  });
+
+  it('blocks openai (Sign in with ChatGPT) in favor of openai-codex', () => {
+    expect(isKnownOAuthProviderId('openai')).toBe(false);
+    expect(listOAuthProviders().some((p) => p.id === 'openai')).toBe(false);
+    expect(listOAuthProviders().some((p) => p.id === 'openai-codex')).toBe(true);
+  });
+
+  it('never lists radius', () => {
+    expect(listOAuthProviders().some((p) => p.id === 'radius')).toBe(false);
+  });
+
+  it('lists each provider id once even when overridden', () => {
+    const ids = listOAuthProviders().map((p) => p.id);
+    expect(ids.length).toBe(new Set(ids).size);
+    expect(ids.filter((id) => id === 'anthropic')).toHaveLength(1);
+  });
+});
