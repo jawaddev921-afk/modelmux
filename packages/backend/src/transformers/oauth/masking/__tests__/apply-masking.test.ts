@@ -1,0 +1,208 @@
+/**
+ * Regression test for the v2 Claude Code OAuth-masking pipeline
+ * (`applyClaudeCodeMasking`), reproducing the shape of production debug
+ * trace 17404760-e986-49b3-8a20-f1a4a469a0ac.
+ *
+ * That request was rejected by Anthropic with
+ * `400 tools: Tool names must be unique.` (duplicate Glob/Grep from the
+ * vendored synthetic-tool injector colliding with pi-ai's own tool
+ * renames), and later — after that fix — with an overage/non-CC billing
+ * rejection (`You're out of extra usage.`) caused by two further gaps:
+ * the CCH signature was never computed (always the literal `cch=00000`
+ * placeholder), and the caller's real system prompt rode through to
+ * Anthropic unmodified instead of being replaced/relocated like a genuine
+ * Claude Code session's would be.
+ *
+ * This test locks in all three fixes against a fixture built from the real
+ * trace's tool-name distribution (see fixtures.ts) so a future change to
+ * any pipeline stage that reintroduces one of these regressions fails here
+ * first.
+ */
+
+import { describe, expect, it, test } from 'bun:test';
+
+import { applyClaudeCodeMasking } from '../apply-masking';
+import { buildFixtureTools, buildPiAiOutputFixture } from './fixtures';
+
+describe('applyClaudeCodeMasking (regression: debug trace 17404760-e986-49b3-8a20-f1a4a469a0ac)', () => {
+  it('produces zero duplicate tool names in the outgoing tools array', () => {
+    const { payload } = applyClaudeCodeMasking(JSON.stringify(buildPiAiOutputFixture()));
+
+    const names: string[] = payload.tools.map((t: any) => t.name);
+    const uniqueNames = new Set(names);
+
+    expect(uniqueNames.size).toBe(names.length);
+  });
+
+  it('injects the synthetic Claude Code tools (Agent, NotebookEdit) with no collision', () => {
+    const { payload } = applyClaudeCodeMasking(JSON.stringify(buildPiAiOutputFixture()));
+    const names: string[] = payload.tools.map((t: any) => t.name);
+
+    // Agent/NotebookEdit have no client-side collision and survive.
+    expect(names).toContain('Agent');
+    expect(names).toContain('NotebookEdit');
+
+    // Glob/Grep/TodoRead are no longer injected as synthetic stubs — real
+    // Claude Code stopped sending these (confirmed against a genuine
+    // on-the-wire capture). The fixture's own Glob/Grep/TodoWrite tools are
+    // not current CC names, so the namespace shape files them under
+    // mcp__client__ rather than leaving them bare.
+    expect(names).not.toContain('Glob');
+    expect(names).not.toContain('Grep');
+    expect(names).not.toContain('TodoRead');
+    expect(names).toContain('mcp__client__Glob');
+    expect(names).toContain('mcp__client__Grep');
+
+    // 161 fixture tools + 2 synthetic (Agent, NotebookEdit) - 0 collisions = 163.
+    expect(payload.tools).toHaveLength(buildFixtureTools().length + 2);
+  });
+
+  it('namespaces every non-CC caller tool under a single mcp__client__ server', () => {
+    const { payload } = applyClaudeCodeMasking(JSON.stringify(buildPiAiOutputFixture()));
+    const names: string[] = payload.tools.map((t: any) => t.name);
+
+    expect(names.filter((n) => n.startsWith('mcp__client__home-assistant_'))).toHaveLength(78);
+    expect(names.filter((n) => n.startsWith('mcp__client__github_'))).toHaveLength(55);
+    expect(names.filter((n) => n.startsWith('mcp__client__ESPhome_'))).toHaveLength(12);
+
+    // Original flat-prefixed names must be gone.
+    expect(names.some((n) => n.startsWith('home-assistant_'))).toBe(false);
+    expect(names.some((n) => n.startsWith('github_'))).toBe(false);
+    expect(names.some((n) => n.startsWith('ESPhome_'))).toBe(false);
+  });
+
+  it('namespaces caller tools with no Claude Code equivalent', () => {
+    const { payload } = applyClaudeCodeMasking(JSON.stringify(buildPiAiOutputFixture()));
+    const names: string[] = payload.tools.map((t: any) => t.name);
+
+    for (const original of [
+      'question',
+      'list_mcp_resource_templates',
+      'list_mcp_resources',
+      'read_mcp_resource',
+      'list_types',
+      'lookup_type',
+      'type_check',
+    ]) {
+      expect(names).not.toContain(original);
+      expect(names).toContain(`mcp__client__${original}`);
+    }
+  });
+
+  it('leaves a real-CC-name collision alone when its shape already matches', () => {
+    // Fixture's "Bash" tool requires only "command" — identical to real
+    // CC's Bash — so there's nothing to disambiguate.
+    const { payload } = applyClaudeCodeMasking(JSON.stringify(buildPiAiOutputFixture()));
+    const names: string[] = payload.tools.map((t: any) => t.name);
+    expect(names).toContain('Bash');
+    expect(names).not.toContain('mcp__client__Bash');
+  });
+
+  it('namespaces a stale non-CC tool name (Glob/Grep/TodoWrite) rather than leaving it bare', () => {
+    const { payload } = applyClaudeCodeMasking(JSON.stringify(buildPiAiOutputFixture()));
+    const names: string[] = payload.tools.map((t: any) => t.name);
+    for (const [original, renamed] of [
+      ['Glob', 'mcp__client__Glob'],
+      ['Grep', 'mcp__client__Grep'],
+      ['TodoWrite', 'mcp__client__TodoWrite'],
+    ]) {
+      expect(names).not.toContain(original);
+      expect<unknown[]>(names).toContain(renamed);
+    }
+  });
+
+  it('renames a real-CC-name collision with an incompatible shape and appends a preference note', () => {
+    // Fixture's Edit/Read/Write/WebFetch/Skill carry opencode's own argument
+    // shape (camelCase, or a differing required set) even though pi-ai
+    // capitalized their names to match real CC's — the exact "same name,
+    // different shape" collision cc-collision-shape.ts exists to catch.
+    const { payload } = applyClaudeCodeMasking(JSON.stringify(buildPiAiOutputFixture()));
+    const toolsByName = new Map(payload.tools.map((t: any) => [t.name, t]));
+
+    for (const [original, renamed] of [
+      ['Edit', 'mcp__client__Edit'],
+      ['Read', 'mcp__client__Read'],
+      ['Write', 'mcp__client__Write'],
+      ['WebFetch', 'mcp__client__WebFetch'],
+      ['Skill', 'mcp__client__Skill'],
+    ]) {
+      expect(toolsByName.has(original)).toBe(false);
+      expect(toolsByName.has(renamed)).toBe(true);
+      expect((toolsByName.get(renamed) as any).description).toBe(
+        `Synthetic description for ${original}\n\nALWAYS USE THIS TOOL INSTEAD OF ${original}.`
+      );
+    }
+  });
+
+  it('replaces system[] with the genuine 3-block Claude Code shape', () => {
+    const { payload } = applyClaudeCodeMasking(JSON.stringify(buildPiAiOutputFixture()));
+
+    expect(payload.system).toHaveLength(3);
+    expect(payload.system[0].text).toMatch(/^x-anthropic-billing-header:/);
+    expect(payload.system[1].text).toBe(
+      "You are Claude Code, Anthropic's official CLI for Claude."
+    );
+    // Static CC prompt, not the caller's system prompt.
+    expect(payload.system[2].text).toMatch(
+      /^You are an interactive agent that helps users with software engineering tasks\./
+    );
+    expect(payload.system[2].text).not.toContain('synthetic/workspace');
+    expect(payload.system[2].text).not.toContain('AGENTS.md');
+  });
+
+  it('relocates the complete caller system content into the first user message', () => {
+    const input = buildPiAiOutputFixture();
+    const { payload } = applyClaudeCodeMasking(JSON.stringify(input));
+
+    const firstUserMessage = payload.messages.find((m: any) => m.role === 'user');
+    const content =
+      typeof firstUserMessage.content === 'string'
+        ? firstUserMessage.content
+        : firstUserMessage.content[0].text;
+
+    expect(content).toContain('<system-reminder>');
+    expect(content).toContain(input.system[1].text);
+    expect(content).toContain('synthetic/workspace');
+    expect(content).toContain('Synthetic agent rules');
+  });
+
+  it('signs the CCH — never sends the unsigned 00000 placeholder', () => {
+    const { payload } = applyClaudeCodeMasking(JSON.stringify(buildPiAiOutputFixture()));
+
+    const billingText = payload.system[0].text as string;
+    expect(billingText).not.toContain('cch=00000');
+    expect(billingText).toMatch(/cch=[0-9a-f]{5};/);
+  });
+
+  it('produces a deterministic signature for identical input (no accidental randomness)', () => {
+    const input = JSON.stringify(buildPiAiOutputFixture());
+    const first = applyClaudeCodeMasking(input);
+    const second = applyClaudeCodeMasking(input);
+
+    expect(first.payload.system[0].text).toBe(second.payload.system[0].text);
+  });
+
+  it('returns toolRenamePairs usable for reverse-mapping the response', () => {
+    const { toolRenamePairs } = applyClaudeCodeMasking(JSON.stringify(buildPiAiOutputFixture()));
+
+    const pairsMap = Object.fromEntries(toolRenamePairs);
+    expect(pairsMap['home-assistant_ha_action_0']).toBe('mcp__client__home-assistant_ha_action_0');
+    expect(pairsMap['github_action_0']).toBe('mcp__client__github_action_0');
+    expect(pairsMap['ESPhome_device_action_0']).toBe('mcp__client__ESPhome_device_action_0');
+  });
+
+  describe('tool description preservation (end-to-end wiring)', () => {
+    // MCP-renamed tools carry no collision note, so their description is a
+    // clean before/after signal. Original name `github_action_0` renames to
+    // `mcp__client__github_action_0`; its description is `Synthetic
+    // description for github_action_0` (see fixtures.ts).
+    const named = (payload: any, name: string) => payload.tools.find((t: any) => t.name === name);
+
+    it('default run preserves the caller tool descriptions', () => {
+      const { payload } = applyClaudeCodeMasking(JSON.stringify(buildPiAiOutputFixture()));
+      expect(named(payload, 'mcp__client__github_action_0').description).toBe(
+        'Synthetic description for github_action_0'
+      );
+    });
+  });
+});
