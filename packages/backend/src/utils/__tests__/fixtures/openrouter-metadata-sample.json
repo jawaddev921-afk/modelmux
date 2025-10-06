@@ -1,0 +1,138 @@
+{
+  "data": [
+    {
+      "id": "anthropic/claude-3.5-sonnet",
+      "name": "Anthropic: Claude 3.5 Sonnet",
+      "description": "Claude 3.5 Sonnet is a highly capable model.",
+      "context_length": 200000,
+      "architecture": {
+        "modality": "text+image->text",
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["text"],
+        "tokenizer": "Claude",
+        "instruct_type": null
+      },
+      "pricing": {
+        "prompt": "0.000003",
+        "completion": "0.000015",
+        "input_cache_read": "0.0000003",
+        "input_cache_write": "0.00000375",
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "prompt": "0.000010",
+            "completion": "0.000045",
+            "input_cache_read": "0.000001",
+            "input_cache_write": "0.0000125"
+          }
+        ]
+      },
+      "supported_parameters": ["temperature", "tools", "tool_choice", "max_tokens", "top_p"],
+      "top_provider": {
+        "context_length": 200000,
+        "max_completion_tokens": 8192,
+        "is_moderated": false
+      }
+    },
+    {
+      "id": "openai/gpt-4.1-nano",
+      "name": "OpenAI: GPT-4.1 Nano",
+      "description": "GPT-4.1 Nano is a lightweight model for fast tasks.",
+      "context_length": 1000000,
+      "architecture": {
+        "modality": "text+image->text",
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["text"],
+        "tokenizer": "GPT",
+        "instruct_type": null
+      },
+      "pricing": {
+        "prompt": "0.0000001",
+        "completion": "0.0000004",
+        "input_cache_read": "0.000000025"
+      },
+      "supported_parameters": [
+        "temperature",
+        "tools",
+        "tool_choice",
+        "max_tokens",
+        "top_p",
+        "response_format"
+      ],
+      "top_provider": {
+        "context_length": 1000000,
+        "max_completion_tokens": 32768,
+        "is_moderated": false
+      }
+    },
+    {
+      "id": "google/gemini-pro",
+      "name": "Google: Gemini Pro",
+      "description": "Gemini Pro is Google's general-purpose model.",
+      "context_length": 128000,
+      "architecture": {
+        "modality": "text+image->text",
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["text"],
+        "tokenizer": "Gemini",
+        "instruct_type": null
+      },
+      "pricing": {
+        "prompt": "0.000000125",
+        "completion": "0.000000375"
+      },
+      "supported_parameters": ["temperature", "max_tokens", "top_p"],
+      "top_provider": {
+        "context_length": 128000,
+        "max_completion_tokens": 8192,
+        "is_moderated": false
+      }
+    },
+    {
+      "id": "openai/gpt-audio",
+      "name": "OpenAI: GPT Audio",
+      "description": "GPT Audio supports audio input and output.",
+      "context_length": 128000,
+      "architecture": {
+        "modality": "text+audio->text+audio",
+        "input_modalities": ["text", "audio"],
+        "output_modalities": ["text", "audio"],
+        "tokenizer": "GPT",
+        "instruct_type": null
+      },
+      "pricing": {
+        "prompt": "0.0000025",
+        "completion": "0.00001"
+      },
+      "supported_parameters": ["temperature", "max_tokens"],
+      "top_provider": {
+        "context_length": 128000,
+        "max_completion_tokens": 16384,
+        "is_moderated": false
+      }
+    },
+    {
+      "id": "mistralai/voxtral-small-24b-2507",
+      "name": "Mistral: Voxtral Small 24B 2507",
+      "description": "Audio understanding model that can transcribe speech from uploaded audio files.",
+      "context_length": 32768,
+      "architecture": {
+        "modality": "text+file+audio->text",
+        "input_modalities": ["text", "audio", "file"],
+        "output_modalities": ["text"],
+        "tokenizer": "Mistral",
+        "instruct_type": null
+      },
+      "pricing": {
+        "prompt": "0.0000001",
+        "completion": "0.0000003"
+      },
+      "supported_parameters": ["temperature", "max_tokens"],
+      "top_provider": {
+        "context_length": 32768,
+        "max_completion_tokens": 4096,
+        "is_moderated": false
+      }
+    }
+  ]
+}
