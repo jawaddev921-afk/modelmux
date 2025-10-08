@@ -1,0 +1,26 @@
+import type { ProviderAdapter } from '../../types/provider-adapter';
+import { modelOverrideAdapter } from './model-override.adapter';
+import { museCodeCompatAdapter } from './muse-code-compat.adapter';
+import { normalizeAnthropicToolIdsAdapter } from './normalize-anthropic-tool-ids.adapter';
+import { reasoningContentAdapter } from './reasoning-content.adapter';
+import { reasoningRewriteAdapter } from './reasoning-rewrite.adapter';
+import { stripUnsupportedToolSearchAdapter } from './strip-unsupported-tool-search.adapter';
+import { suppressDeveloperRoleAdapter } from './suppress-developer-role.adapter';
+import { suppressUnsupportedGpt5OptionsAdapter } from './suppress-unsupported-gpt5-options.adapter';
+import { webSearchCoercionAdapter } from './web-search-coercion.adapter';
+
+/**
+ * Registry of all built-in provider adapters.
+ * Keys must match the name field used in provider/model config `adapter` entries.
+ */
+export const ADAPTER_REGISTRY: Record<string, ProviderAdapter> = {
+  [reasoningContentAdapter.name]: reasoningContentAdapter,
+  [suppressDeveloperRoleAdapter.name]: suppressDeveloperRoleAdapter,
+  [modelOverrideAdapter.name]: modelOverrideAdapter,
+  [reasoningRewriteAdapter.name]: reasoningRewriteAdapter,
+  [webSearchCoercionAdapter.name]: webSearchCoercionAdapter,
+  [stripUnsupportedToolSearchAdapter.name]: stripUnsupportedToolSearchAdapter,
+  [suppressUnsupportedGpt5OptionsAdapter.name]: suppressUnsupportedGpt5OptionsAdapter,
+  [normalizeAnthropicToolIdsAdapter.name]: normalizeAnthropicToolIdsAdapter,
+  [museCodeCompatAdapter.name]: museCodeCompatAdapter,
+};
