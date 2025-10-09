@@ -1,0 +1,383 @@
+import { afterEach, beforeEach, describe, expect, it, jest } from 'bun:test';
+import { PassThrough } from 'stream';
+
+import { type StallConfig, StallInspector } from '../stall-inspector';
+
+function createConfig(overrides: Partial<StallConfig> = {}): StallConfig {
+  return {
+    ttfbMs: 5000,
+    ttfbBytes: 100,
+    minBytesPerSecond: 500,
+    windowMs: 10000,
+    gracePeriodMs: 3000,
+    ...overrides,
+  };
+}
+
+function createChunk(size: number): Buffer {
+  return Buffer.alloc(size, 'a');
+}
+
+describe('StallInspector', () => {
+  let abortController: AbortController;
+  let abortReason: DOMException | null = null;
+
+  beforeEach(() => {
+    abortController = new AbortController();
+    abortReason = null;
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  describe('TTFB is handled at dispatcher level', () => {
+    it("does NOT start a TTFB timer — that is the dispatcher probe's job", () => {
+      jest.useFakeTimers();
+
+      const config = createConfig({ ttfbMs: 5000, ttfbBytes: 100, minBytesPerSecond: null });
+      const inspector = new StallInspector('req-1', config, abortController);
+
+      // Write only 50 bytes (below the 100-byte threshold)
+      inspector.write(createChunk(50));
+
+      // Advance past TTFB timeout — the StallInspector should NOT abort
+      // because TTFB detection is handled by the dispatcher's probe
+      jest.advanceTimersByTime(5001);
+      expect(abortController.signal.aborted).toBe(false);
+
+      inspector.destroy();
+    });
+
+    it('does not abort even when ttfbMs expires with no bytes', () => {
+      jest.useFakeTimers();
+
+      const config = createConfig({ ttfbMs: 5000, ttfbBytes: 100, minBytesPerSecond: null });
+      const inspector = new StallInspector('req-2', config, abortController);
+
+      // Advance past TTFB timeout without any bytes
+      jest.advanceTimersByTime(6000);
+      expect(abortController.signal.aborted).toBe(false);
+
+      inspector.destroy();
+    });
+  });
+
+  describe('Throughput stall detection', () => {
+    it('detects throughput stall after grace period when stream is too slow', () => {
+      jest.useFakeTimers();
+
+      const config = createConfig({
+        ttfbMs: null,
+        minBytesPerSecond: 500,
+        windowMs: 3000,
+        gracePeriodMs: 1000,
+      });
+      const inspector = new StallInspector('req-5', config, abortController);
+
+      abortController.signal.addEventListener('abort', () => {
+        abortReason = abortController.signal.reason;
+      });
+
+      // Write initial bytes to transition past DISPATCHED state
+      inspector.write(createChunk(100));
+
+      // Advance through grace period
+      jest.advanceTimersByTime(1100);
+      // Write a very small amount (10 bytes)
+      inspector.write(createChunk(10));
+
+      // Advance past the window so throughput is clearly below 500 B/s
+      jest.advanceTimersByTime(3100);
+      expect(abortController.signal.aborted).toBe(true);
+      expect(abortReason?.name).toBe('TimeoutError');
+      expect(abortReason?.message).toContain('throughput');
+
+      inspector.destroy();
+    });
+
+    it('does not abort when throughput is above threshold', () => {
+      jest.useFakeTimers();
+
+      const config = createConfig({
+        ttfbMs: null,
+        minBytesPerSecond: 100,
+        windowMs: 2000,
+        gracePeriodMs: 500,
+      });
+      const inspector = new StallInspector('req-6', config, abortController);
+
+      // Write initial bytes to trigger monitoring
+      inspector.write(createChunk(100));
+
+      // Advance through grace period
+      jest.advanceTimersByTime(600);
+      // Write enough bytes to stay above 100 B/s
+      // 100 bytes over 2 seconds = 50 B/s, so we need more
+      inspector.write(createChunk(500));
+
+      // Not enough time for a stall yet
+      expect(abortController.signal.aborted).toBe(false);
+
+      // Continue writing enough data
+      jest.advanceTimersByTime(1000);
+      inspector.write(createChunk(500));
+
+      expect(abortController.signal.aborted).toBe(false);
+
+      inspector.destroy();
+    });
+
+    it('catches fully stalled stream via periodic check (no chunks arriving)', () => {
+      jest.useFakeTimers();
+
+      const config = createConfig({
+        ttfbMs: 5000,
+        ttfbBytes: 100,
+        minBytesPerSecond: 500,
+        windowMs: 3000,
+        gracePeriodMs: 1000,
+      });
+      const inspector = new StallInspector('req-7', config, abortController);
+
+      abortController.signal.addEventListener('abort', () => {
+        abortReason = abortController.signal.reason;
+      });
+
+      // Write enough bytes to transition out of DISPATCHED state
+      inspector.write(createChunk(200));
+
+      // Advance through grace period + some monitoring time
+      // The periodic check fires every windowMs/2 = 1500ms
+      jest.advanceTimersByTime(2000);
+      // Past grace period (1000ms) + into monitoring
+
+      // Write a tiny chunk to create a second data point
+      inspector.write(createChunk(5));
+
+      // Now advance far enough that throughput over the window is below threshold.
+      // With 205 total bytes over 5+ seconds, throughput is ~40 B/s, well below 500.
+      jest.advanceTimersByTime(4000);
+      expect(abortController.signal.aborted).toBe(true);
+      expect(abortReason?.message).toContain('throughput');
+
+      inspector.destroy();
+    });
+  });
+
+  describe('State machine', () => {
+    it('transitions from DISPATCHED to GRACE_PERIOD on first chunk when throughput monitoring is active', () => {
+      jest.useFakeTimers();
+
+      const config = createConfig({
+        ttfbMs: 10000,
+        ttfbBytes: 50,
+        minBytesPerSecond: 100,
+        gracePeriodMs: 5000,
+      });
+      const inspector = new StallInspector('req-8', config, abortController);
+
+      // Write first chunk — should transition to GRACE_PERIOD
+      inspector.write(createChunk(60));
+
+      // TTFB timer no longer exists — should not abort
+      jest.advanceTimersByTime(11000);
+      expect(abortController.signal.aborted).toBe(false);
+
+      inspector.destroy();
+    });
+
+    it('transitions from GRACE_PERIOD to MONITORING after grace period', () => {
+      jest.useFakeTimers();
+
+      const config = createConfig({
+        ttfbMs: 5000,
+        ttfbBytes: 50,
+        minBytesPerSecond: 100,
+        windowMs: 3000,
+        gracePeriodMs: 2000,
+      });
+      const inspector = new StallInspector('req-9', config, abortController);
+
+      // First chunk triggers transition to GRACE_PERIOD
+      inspector.write(createChunk(60));
+
+      // During grace period — no abort even if throughput is low
+      jest.advanceTimersByTime(1000);
+      expect(abortController.signal.aborted).toBe(false);
+
+      // Advance past grace period but keep sending data
+      jest.advanceTimersByTime(1500);
+      inspector.write(createChunk(1000)); // Plenty of throughput
+      expect(abortController.signal.aborted).toBe(false);
+
+      inspector.destroy();
+    });
+
+    it('stays in DISPATCHED if no throughput monitoring is configured', () => {
+      jest.useFakeTimers();
+
+      const config = createConfig({ ttfbMs: 5000, minBytesPerSecond: null });
+      const inspector = new StallInspector('req-dispatched', config, abortController);
+
+      // Write bytes — but no throughput monitoring, so should stay in DISPATCHED
+      inspector.write(createChunk(100));
+
+      // Advance time — should not abort (no TTFB timer, no throughput check)
+      jest.advanceTimersByTime(10000);
+      expect(abortController.signal.aborted).toBe(false);
+
+      inspector.destroy();
+    });
+  });
+
+  describe('updateConfig', () => {
+    it('updates config but does not start TTFB timer (dispatcher handles TTFB)', () => {
+      jest.useFakeTimers();
+
+      const config = createConfig({ ttfbMs: 10000, ttfbBytes: 100, minBytesPerSecond: null });
+      const inspector = new StallInspector('req-10', config, abortController);
+
+      // Per-provider override with shorter TTFB — but the inspector should NOT
+      // start a TTFB timer because TTFB detection is handled by the dispatcher probe
+      inspector.updateConfig({
+        ...config,
+        ttfbMs: 5000,
+      });
+
+      // Advance well past the 5000ms TTFB — should NOT abort
+      jest.advanceTimersByTime(6000);
+      expect(abortController.signal.aborted).toBe(false);
+
+      inspector.destroy();
+    });
+
+    it('enables throughput monitoring when updateConfig adds minBytesPerSecond', () => {
+      jest.useFakeTimers();
+
+      const config = createConfig({ ttfbMs: 5000, minBytesPerSecond: null });
+      const inspector = new StallInspector('req-10b', config, abortController);
+
+      abortController.signal.addEventListener('abort', () => {
+        abortReason = abortController.signal.reason;
+      });
+
+      // Write initial data while no throughput monitoring
+      inspector.write(createChunk(50));
+
+      // Update config to enable throughput monitoring
+      inspector.updateConfig({
+        ...config,
+        minBytesPerSecond: 1000,
+        gracePeriodMs: 500,
+        windowMs: 2000,
+      });
+
+      // Write a chunk to trigger state transition (DISPATCHED → GRACE_PERIOD)
+      inspector.write(createChunk(5));
+
+      // Advance through grace period + monitoring window + periodic check
+      jest.advanceTimersByTime(5000);
+      expect(abortController.signal.aborted).toBe(true);
+      expect(abortReason?.message).toContain('throughput');
+
+      inspector.destroy();
+    });
+  });
+
+  describe('Cleanup', () => {
+    it('cleans up timers on destroy', () => {
+      jest.useFakeTimers();
+
+      const config = createConfig({ minBytesPerSecond: 500, gracePeriodMs: 1000 });
+      const inspector = new StallInspector('req-11', config, abortController);
+
+      // Start monitoring
+      inspector.write(createChunk(100));
+
+      inspector.destroy();
+
+      // Timer should be cleared — no abort after the timeout
+      jest.advanceTimersByTime(6000);
+      expect(abortController.signal.aborted).toBe(false);
+    });
+
+    it('cleans up timers on flush (normal stream end)', () => {
+      jest.useFakeTimers();
+
+      const config = createConfig({ minBytesPerSecond: 500, gracePeriodMs: 1000 });
+      const inspector = new StallInspector('req-12', config, abortController);
+
+      // Start monitoring
+      inspector.write(createChunk(100));
+
+      // Simulate a normal stream end
+      inspector.end();
+
+      jest.advanceTimersByTime(6000);
+      expect(abortController.signal.aborted).toBe(false);
+    });
+  });
+
+  describe('Passthrough behavior', () => {
+    it('passes chunks through unchanged', () => {
+      const config = createConfig({ ttfbMs: 5000, minBytesPerSecond: null });
+      const inspector = new StallInspector('req-13', config, abortController);
+
+      const received: Buffer[] = [];
+      inspector.on('data', (chunk: Buffer) => received.push(chunk));
+
+      const chunk1 = createChunk(50);
+      const chunk2 = createChunk(75);
+
+      inspector.write(chunk1);
+      inspector.write(chunk2);
+
+      expect(received.length).toBe(2);
+      expect(received[0]!.length).toBe(50);
+      expect(received[1]!.length).toBe(75);
+
+      inspector.destroy();
+    });
+  });
+
+  describe('semantic progress accounting', () => {
+    it('excludes Responses lifecycle events from token-estimate bytes', () => {
+      const inspector = new StallInspector(
+        'req-responses-progress',
+        createConfig({ minBytesPerSecond: null }),
+        abortController
+      );
+      inspector.setProgressApiType('responses');
+
+      const lifecycle = 'event: response.created\ndata: {"type":"response.created"}\n\n';
+      const delta =
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hi"}\n\n';
+      inspector.write(Buffer.from(lifecycle + delta.slice(0, 24)));
+      inspector.write(Buffer.from(delta.slice(24)));
+
+      const stats = inspector.getStats();
+      expect(stats.bytesReceived).toBe(Buffer.byteLength(lifecycle + delta));
+      expect(stats.semanticBytesReceived).toBe(Buffer.byteLength(delta));
+
+      inspector.destroy();
+    });
+
+    it('uses all streamed bytes for non-Responses formats', () => {
+      const inspector = new StallInspector(
+        'req-chat-progress',
+        createConfig({ minBytesPerSecond: null }),
+        abortController
+      );
+      inspector.setProgressApiType('chat');
+
+      const chunk = Buffer.from('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n');
+      inspector.write(chunk);
+
+      const stats = inspector.getStats();
+      expect(stats.semanticBytesReceived).toBe(chunk.length);
+
+      inspector.destroy();
+    });
+  });
+});
