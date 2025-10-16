@@ -1,0 +1,319 @@
+import { and, desc, eq, like, lt, sql } from 'drizzle-orm';
+
+import * as pgMcp from '../../../drizzle/schema/postgres/mcp';
+import * as sqliteMcp from '../../../drizzle/schema/sqlite/mcp';
+import { getCurrentDialect, getDatabase } from '../../db/client';
+import { logger } from '../../utils/logger';
+import { toDbTimestamp } from '../../utils/normalize';
+import { getUsageRetentionDays } from '../observability/usage-storage';
+
+interface McpRequestUsageRecord {
+  request_id: string;
+  created_at: string;
+  start_time: number;
+  duration_ms: number | null;
+  server_name: string;
+  upstream_url: string;
+  method: 'POST' | 'GET' | 'DELETE';
+  jsonrpc_method: string | null;
+  tool_name: string | null;
+  api_key: string | null;
+  attribution: string | null;
+  source_ip: string | null;
+  response_status: number | null;
+  is_streamed: boolean;
+  has_debug: boolean;
+  error_code: string | null;
+  error_message: string | null;
+}
+
+interface McpDebugLogRecord {
+  request_id: string;
+  raw_request_headers: string | null;
+  raw_request_body: string | null;
+  raw_response_headers: string | null;
+  raw_response_body: string | null;
+  created_at: string;
+}
+
+export class McpUsageStorageService {
+  private db: ReturnType<typeof getDatabase> | null = null;
+  private cleanupInterval: ReturnType<typeof setInterval> | null = null;
+  /** In-flight initial sweep, awaited by the matching stop() so it cannot outlive the caller. */
+  private initialSweep: Promise<unknown> | null = null;
+
+  constructor() {}
+
+  private ensureDb() {
+    if (!this.db) {
+      this.db = getDatabase();
+    }
+    return this.db;
+  }
+
+  private getMcpSchema() {
+    const dialect = getCurrentDialect();
+    if (dialect === 'sqlite') {
+      return sqliteMcp;
+    } else {
+      return pgMcp;
+    }
+  }
+
+  async saveRequest(record: McpRequestUsageRecord) {
+    try {
+      const schema = this.getMcpSchema();
+      const mcpRequestUsage = schema.mcpRequestUsage;
+      const createdAt = toDbTimestamp(record.created_at, getCurrentDialect()) as string & Date;
+
+      await this.ensureDb()
+        .insert(mcpRequestUsage)
+        .values({
+          requestId: record.request_id,
+          createdAt,
+          startTime: record.start_time,
+          durationMs: record.duration_ms,
+          serverName: record.server_name,
+          upstreamUrl: record.upstream_url,
+          method: record.method,
+          jsonrpcMethod: record.jsonrpc_method,
+          toolName: record.tool_name,
+          apiKey: record.api_key,
+          attribution: record.attribution,
+          sourceIp: record.source_ip,
+          responseStatus: record.response_status,
+          isStreamed: record.is_streamed ? 1 : 0,
+          hasDebug: record.has_debug ? 1 : 0,
+          errorCode: record.error_code,
+          errorMessage: record.error_message,
+        });
+
+      logger.debug(`MCP usage record saved for request ${record.request_id}`);
+    } catch (error) {
+      logger.error('Failed to save MCP usage record', error);
+    }
+  }
+
+  async saveDebugLog(record: McpDebugLogRecord) {
+    try {
+      const schema = this.getMcpSchema();
+      const mcpDebugLogs = schema.mcpDebugLogs;
+      const createdAt = toDbTimestamp(record.created_at, getCurrentDialect()) as string & Date;
+
+      await this.ensureDb().insert(mcpDebugLogs).values({
+        requestId: record.request_id,
+        rawRequestHeaders: record.raw_request_headers,
+        rawRequestBody: record.raw_request_body,
+        rawResponseHeaders: record.raw_response_headers,
+        rawResponseBody: record.raw_response_body,
+        createdAt,
+      });
+
+      logger.debug(`MCP debug log saved for request ${record.request_id}`);
+    } catch (error) {
+      logger.error('Failed to save MCP debug log', error);
+    }
+  }
+
+  async getLogs(
+    options: { limit?: number; offset?: number; serverName?: string; apiKey?: string } = {}
+  ): Promise<{ data: McpRequestUsageRecord[]; total: number }> {
+    try {
+      const schema = this.getMcpSchema();
+      const table = schema.mcpRequestUsage;
+      const db = this.ensureDb();
+      const limit = options.limit ?? 20;
+      const offset = options.offset ?? 0;
+
+      const conditions = [];
+      if (options.serverName) {
+        conditions.push(like(table.serverName, `%${options.serverName}%`));
+      }
+      if (options.apiKey) {
+        conditions.push(like(table.apiKey, `%${options.apiKey}%`));
+      }
+
+      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+      const [rows, countRows] = await Promise.all([
+        db
+          .select()
+          .from(table)
+          .where(whereClause)
+          .orderBy(desc(table.startTime))
+          .limit(limit)
+          .offset(offset),
+        db
+          .select({ count: sql<number>`COUNT(*)` })
+          .from(table)
+          .where(whereClause),
+      ]);
+
+      const total = Number(countRows[0]?.count ?? 0);
+
+      const data: McpRequestUsageRecord[] = rows.map((r: any) => ({
+        request_id: r.requestId,
+        created_at: r.createdAt,
+        start_time: r.startTime,
+        duration_ms: r.durationMs,
+        server_name: r.serverName,
+        upstream_url: r.upstreamUrl,
+        method: r.method,
+        jsonrpc_method: r.jsonrpcMethod,
+        tool_name: r.toolName ?? null,
+        api_key: r.apiKey,
+        attribution: r.attribution,
+        source_ip: r.sourceIp,
+        response_status: r.responseStatus,
+        is_streamed: Boolean(r.isStreamed),
+        has_debug: Boolean(r.hasDebug),
+        error_code: r.errorCode,
+        error_message: r.errorMessage,
+      }));
+
+      return { data, total };
+    } catch (error) {
+      logger.error('Failed to get MCP logs', error);
+      return { data: [], total: 0 };
+    }
+  }
+
+  async deleteLog(requestId: string): Promise<boolean> {
+    try {
+      const schema = this.getMcpSchema();
+      const table = schema.mcpRequestUsage;
+      const result = await this.ensureDb().delete(table).where(eq(table.requestId, requestId));
+      return true;
+    } catch (error) {
+      logger.error('Failed to delete MCP log', error);
+      return false;
+    }
+  }
+
+  async deleteAllLogs(beforeDate?: Date): Promise<boolean> {
+    try {
+      const schema = this.getMcpSchema();
+      const table = schema.mcpRequestUsage;
+      const db = this.ensureDb();
+
+      if (beforeDate) {
+        const beforeMs = beforeDate.getTime();
+        await db.delete(table).where(sql`${table.startTime} < ${beforeMs}`);
+      } else {
+        await db.delete(table);
+      }
+      return true;
+    } catch (error) {
+      logger.error('Failed to delete MCP logs', error);
+      return false;
+    }
+  }
+
+  /**
+   * Delete `mcp_request_usage` and `mcp_debug_logs` rows older than `ttlDays`.
+   * Returns per-table deletion counts.
+   */
+  async cleanupOldLogs(
+    ttlDays: number = getUsageRetentionDays()
+  ): Promise<{ deletedLogs: number; deletedDebugLogs: number }> {
+    const cutoffMs = Date.now() - ttlDays * 24 * 60 * 60 * 1000;
+    try {
+      const schema = this.getMcpSchema();
+      const db = this.ensureDb();
+      const dialect = getCurrentDialect();
+
+      const logRows = await db
+        .select({ count: sql<number>`COUNT(*)` })
+        .from(schema.mcpRequestUsage)
+        .where(sql`${schema.mcpRequestUsage.startTime} < ${cutoffMs}`);
+      const deletedLogs = Number(logRows[0]?.count ?? 0);
+
+      // created_at is an ISO string in SQLite but a timestamp in Postgres.
+      const debugCutoff =
+        dialect === 'sqlite' ? new Date(cutoffMs).toISOString() : new Date(cutoffMs);
+      const debugRows = await db
+        .select({ count: sql<number>`COUNT(*)` })
+        .from(schema.mcpDebugLogs)
+        .where(lt(schema.mcpDebugLogs.createdAt, debugCutoff as any));
+      const deletedDebugLogs = Number(debugRows[0]?.count ?? 0);
+
+      if (deletedLogs > 0) {
+        const ok = await this.deleteAllLogs(new Date(cutoffMs));
+        if (!ok) {
+          throw new Error('Failed to delete old MCP request logs');
+        }
+      }
+      if (deletedDebugLogs > 0) {
+        await db
+          .delete(schema.mcpDebugLogs)
+          .where(lt(schema.mcpDebugLogs.createdAt, debugCutoff as any));
+      }
+
+      if (deletedLogs > 0 || deletedDebugLogs > 0) {
+        logger.debug(
+          `MCP retention cleanup: deleted ${deletedLogs} logs and ` +
+            `${deletedDebugLogs} debug logs older than ${ttlDays} days`
+        );
+      }
+
+      return { deletedLogs, deletedDebugLogs };
+    } catch (error) {
+      logger.error('Failed to clean up old MCP logs', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Start the scheduled retention job that prunes MCP request logs and debug
+   * logs older than `ttlDays`. Runs an initial sweep immediately, then
+   * repeats every `intervalHours`.
+   */
+  startCleanupJob(intervalHours: number = 24, ttlDays: number = getUsageRetentionDays()): void {
+    if (this.cleanupInterval) {
+      logger.warn('MCP retention cleanup job already running');
+      return;
+    }
+
+    // Run initial cleanup
+    this.initialSweep = this.cleanupOldLogs(ttlDays).catch((err) =>
+      logger.error('Initial MCP retention cleanup failed:', err)
+    );
+
+    // Schedule periodic cleanup
+    this.cleanupInterval = setInterval(
+      async () => {
+        try {
+          const result = await this.cleanupOldLogs(ttlDays);
+          const total = result.deletedLogs + result.deletedDebugLogs;
+          if (total > 0) {
+            logger.debug(
+              `Scheduled MCP retention cleanup: deleted ${result.deletedLogs} logs, ` +
+                `${result.deletedDebugLogs} debug logs`
+            );
+          }
+        } catch (err) {
+          logger.error('Scheduled MCP retention cleanup failed:', err);
+        }
+      },
+      intervalHours * 60 * 60 * 1000
+    );
+
+    logger.debug(
+      `MCP retention cleanup job started (every ${intervalHours}h, TTL ${ttlDays} days)`
+    );
+  }
+
+  /**
+   * Stop the retention cleanup job.
+   */
+  async stopCleanupJob(): Promise<void> {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+      logger.debug('MCP retention cleanup job stopped');
+    }
+    const sweep = this.initialSweep;
+    this.initialSweep = null;
+    await sweep;
+  }
+}
