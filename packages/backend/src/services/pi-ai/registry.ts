@@ -1,0 +1,438 @@
+/**
+ * Shared pi-ai registry helpers used by the standard dispatch path and
+ * registry-aware adapter work.
+ *
+ * This module owns:
+ *  - resolveBaseUrl: resolve the api_base_url union and apply SDK-specific
+ *    base-URL stripping rules, keyed off the upstream pi-ai API.
+ *  - buildReasoningOptionsForModel / buildGenerationOptions: capability-aware
+ *    egress reasoning + generation options from the pi-ai Model record.
+ *  - resolvePiAiModel: resolve a pi-ai Model for a (provider, model) pair.
+ *  - isPlaceholderThinkingSignature: guard against pi-ai's field-name placeholder
+ *    thinking signatures.
+ */
+
+import { clampThinkingLevel, getSupportedThinkingLevels } from '@earendil-works/pi-ai';
+import type { Model as PiAiModel, ModelThinkingLevel } from '@earendil-works/pi-ai';
+
+import { logger } from '../../utils/logger';
+import type { ServiceTierFormat, ServiceTierMap } from '../dispatch/service-tier-selection';
+import { inferServiceTierFormat, resolveServiceTier } from '../dispatch/service-tier-selection';
+import type { RouteResult } from '../routing/router';
+import { getCatalogModel } from './catalog';
+import type { GenerationIntent } from './generation';
+import type { ReasoningEffort, ReasoningIntent } from './reasoning';
+import { clampEffortToWindow, effortToBudget, intentToEffort } from './reasoning';
+
+// ─── resolveBaseUrl ───────────────────────────────────────────────────────────
+//
+// Resolves the `api_base_url` from a `string | Record<string, string>` union
+// using the *upstream* pi-ai API as the primary key (not the client-facing
+// route type), then applies SDK-specific base-URL rules:
+//
+//  - anthropic-messages: strip a trailing bare `/v\d+` because the Anthropic
+//    SDK appends `/v1` itself.
+//  - all other API types: preserve the full URL (those SDKs only append the
+//    endpoint path, e.g. `/chat/completions`).
+//
+// When apiBaseUrl is a Record, the key lookup order is:
+//   1. Exact match on upstreamApi (e.g. "anthropic-messages")
+//   2. Known ModelMux alias for that upstream API
+//   3. "default"
+//   4. First value in the record
+
+const UPSTREAM_API_ALIASES: Record<string, string[]> = {
+  'openai-completions': ['chat'],
+  'openai-responses': ['responses'],
+  'anthropic-messages': ['messages'],
+  'google-generative-ai': ['gemini'],
+  'openai-codex-responses': ['codex'],
+  'azure-openai-responses': ['azure'],
+  'google-generative-ai-vertex': ['vertex'],
+};
+
+export function resolveBaseUrl(
+  apiBaseUrl: string | Record<string, string> | undefined,
+  upstreamApi: string,
+  _incomingApiType?: string
+): string {
+  let rawUrl: string;
+
+  if (!apiBaseUrl) {
+    rawUrl = '';
+  } else if (typeof apiBaseUrl === 'string') {
+    rawUrl = apiBaseUrl;
+  } else {
+    // Record: try the upstream API key first, then known aliases, then "default", then first value
+    const aliases = UPSTREAM_API_ALIASES[upstreamApi] ?? [];
+    const keys = [upstreamApi, ...aliases, 'default'];
+    let found: string | undefined;
+    for (const key of keys) {
+      if (key in apiBaseUrl) {
+        found = apiBaseUrl[key];
+        break;
+      }
+    }
+    if (found === undefined) {
+      // Fall back to first value
+      const firstEntry = Object.values(apiBaseUrl)[0];
+      found = firstEntry ?? '';
+    }
+    rawUrl = found;
+  }
+
+  // Apply SDK-specific base-URL rules:
+  // Anthropic SDK appends /v1 itself — strip a trailing bare /v<digits>
+  if (upstreamApi === 'anthropic-messages') {
+    // Strip trailing /v<digits> (e.g. /v1, /v2) but not /v1/something
+    rawUrl = rawUrl.replace(/\/v\d+\/?$/, '');
+  }
+  // Remove trailing slash for consistency
+  rawUrl = rawUrl.replace(/\/$/, '');
+
+  return rawUrl;
+}
+
+// ─── Capability-aware reasoning (Layer 2 + Layer 3) ───────────────────────────
+//
+// `buildReasoningOptionsForModel` builds egress reasoning options from the
+// authoritative pi-ai `Model` record instead of matching model-ID substrings:
+//
+//   - `model.reasoning`                  → does this model reason at all?
+//   - `model.thinkingLevelMap`           → which effort levels are supported,
+//                                          and what provider value each maps to;
+//                                          `off: null` means "cannot disable".
+//   - `model.compat.forceAdaptiveThinking` (Anthropic) → adaptive `effort` mode
+//                                          vs legacy `thinkingBudgetTokens`.
+//
+// Level clamping is delegated to pi-ai's own `clampThinkingLevel` /
+// `getSupportedThinkingLevels`, so as new models land in the pi-ai registry the
+// correct behaviour comes for free with no ModelMux code change.
+//
+// Layer 3 default semantics (tri-state `enabled`):
+//   - intent resolves to a concrete effort  → enable thinking at that effort
+//   - intent explicitly 'off'               → disable, but only if the model
+//                                              actually supports disabling
+//   - intent is undefined (client said       → emit NOTHING and let the model
+//     nothing)                                 use its native default
+
+function modelSupportsDisable(model: PiAiModel<any>): boolean {
+  // thinkingLevelMap.off === null means the provider cannot turn thinking off.
+  return (model.thinkingLevelMap as any)?.off !== null;
+}
+
+/** Build the egress thinking options for a resolved pi-ai model + intent. */
+export function buildReasoningOptionsForModel(
+  model: Pick<PiAiModel<any>, 'api' | 'reasoning' | 'thinkingLevelMap' | 'compat'> & {
+    id?: string;
+  },
+  intent: ReasoningIntent | undefined
+): Record<string, any> {
+  const api = model.api as string | undefined;
+
+  // Non-reasoning models never receive thinking params, regardless of request.
+  if (!model.reasoning) return {};
+
+  const resolved = intent ? intentToEffort(intent) : undefined;
+
+  // ── Client said nothing → defer to the model's native default ──────────────
+  // (Layer 3: do NOT force-disable. The previous behaviour silently turned
+  //  thinking off for reason-by-default models, surprising users.)
+  if (resolved === undefined) return {};
+
+  // ── Explicit disable ───────────────────────────────────────────────────────
+  if (resolved === 'off') {
+    if (!modelSupportsDisable(model as PiAiModel<any>)) {
+      // Model cannot disable thinking — clamp to its lowest supported level
+      // instead of emitting an option the provider will reject.
+      const isAdaptiveAnthropic =
+        api === 'anthropic-messages' &&
+        (model.compat as { forceAdaptiveThinking?: boolean })?.forceAdaptiveThinking === true;
+      const supported = getSupportedThinkingLevels(model as PiAiModel<any>).filter(
+        (l) => l !== 'off' && (!isAdaptiveAnthropic || l !== 'minimal')
+      );
+      const lowest = isAdaptiveAnthropic ? 'low' : (supported[0] as ReasoningEffort | undefined);
+      if (!lowest) return {};
+      return buildEnabledOptions(model, lowest, intent);
+    }
+    if (api === 'anthropic-messages') return { thinkingEnabled: false, reasoning: 'off' };
+    if (api === 'google-generative-ai' || api === 'google-generative-ai-vertex') {
+      return { thinking: { enabled: false }, reasoning: 'off' };
+    }
+    // OpenAI family: pi-ai emits the off-level via thinkingLevelMap itself.
+    return { reasoning: 'off' };
+  }
+
+  // ── Enable at a concrete (clamped) effort ──────────────────────────────────
+  const clamped = clampThinkingLevel(model as PiAiModel<any>, resolved as ModelThinkingLevel);
+  if (clamped === 'off') {
+    // The requested level isn't supported and clamped down to off — treat as
+    // "let the model default" rather than forcing disable.
+    return {};
+  }
+  return buildEnabledOptions(model, clamped as ReasoningEffort, intent);
+}
+
+/** Construct the per-API enabled-thinking option object for a known effort. */
+function buildEnabledOptions(
+  model: Pick<PiAiModel<any>, 'api' | 'thinkingLevelMap' | 'compat'> & { id?: string },
+  effort: ReasoningEffort,
+  intent: ReasoningIntent | undefined
+): Record<string, any> {
+  const api = model.api as string | undefined;
+  // streamSimple-compatibility field; pi-ai's stream() clamps it again safely.
+  const base: Record<string, any> = { reasoning: effort };
+
+  if (
+    api === 'openai-responses' ||
+    api === 'openai-codex-responses' ||
+    api === 'openai-completions' ||
+    api === 'azure-openai-responses'
+  ) {
+    base.reasoningEffort = effort;
+    // Reasoning visibility → OpenAI `reasoning.summary`. Prefer the client's
+    // exact granularity (summaryDetail) when given; otherwise map visibility.
+    if (intent?.visibility === 'summary' || intent?.visibility === 'full') {
+      base.reasoningSummary = intent.summaryDetail ?? 'auto';
+    }
+    return base;
+  }
+
+  if (api === 'anthropic-messages') {
+    base.thinkingEnabled = true;
+    // Reasoning visibility → Anthropic thinking display. 'full' → raw thoughts,
+    // 'summary' → summarized; pi-ai defaults to 'summarized' when unset.
+    if (intent?.visibility === 'full') {
+      base.thinkingDisplay = 'raw';
+    } else if (intent?.visibility === 'summary') {
+      base.thinkingDisplay = 'summarized';
+    } else if (intent?.visibility === 'hidden') {
+      base.thinkingDisplay = 'omitted';
+    }
+    if ((model.compat as { forceAdaptiveThinking?: boolean })?.forceAdaptiveThinking === true) {
+      if (intent?.adaptive === true && intent?.effort == null) {
+        // True adaptive: the client enabled thinking without committing to a
+        // magnitude. Pass `thinkingEnabled: true` alone and let the model
+        // decide how much to think — the native semantics of Anthropic
+        // `thinking.type: 'adaptive'`. Do NOT pin `effort`, and drop the
+        // streamSimple-compat `reasoning` level so nothing re-quantizes it.
+        delete base.reasoning;
+      } else {
+        // Client committed to a magnitude (explicit effort / reasoning suffix):
+        // pass it and let pi-ai map it via thinkingLevelMap (e.g. xhigh → "max"
+        // on Opus 4.6). Clamp to Anthropic's allowed window ['low', 'max'].
+        base.effort = clampEffortToWindow(effort, 'low', 'max');
+      }
+    } else {
+      // Budget-based thinking for older Claude models. Round-trip the client's
+      // exact budget when they gave one; otherwise derive from the effort.
+      base.thinkingBudgetTokens = intent?.budgetTokens ?? effortToBudget(effort);
+    }
+    return base;
+  }
+
+  if (api === 'google-generative-ai' || api === 'google-generative-ai-vertex') {
+    // pi-ai's stream() google path passes `thinking.level` through verbatim and
+    // `thinking.budgetTokens` through verbatim — it does NOT apply
+    // thinkingLevelMap (that only happens in streamSimpleGoogle). So we must
+    // pick the right shape ourselves:
+    //   - Level-based models (Gemini 3 / Gemma 4) carry concrete level entries
+    //     in thinkingLevelMap; map the effort → provider value (e.g. "HIGH").
+    //   - Budget-based models (Gemini 2.x) have no level map; send budgetTokens
+    //     (round-trip the client's budget when present).
+    const tlm = model.thinkingLevelMap as Record<string, string | null> | undefined;
+    const isLevelBased =
+      tlm != null &&
+      (['minimal', 'low', 'medium', 'high', 'xhigh'] as const).some(
+        (l) => typeof tlm[l] === 'string'
+      );
+    // Gemini surfaces thinking via includeThoughts; default to visible unless
+    // the client explicitly asked to hide it.
+    const includeThoughts = intent?.visibility !== 'hidden';
+    if (isLevelBased) {
+      const providerLevel = tlm?.[effort];
+      base.thinking = {
+        enabled: true,
+        includeThoughts,
+        level: typeof providerLevel === 'string' ? providerLevel : effort.toUpperCase(),
+      };
+    } else {
+      base.thinking = {
+        enabled: true,
+        includeThoughts,
+        budgetTokens: intent?.budgetTokens ?? effortToBudget(effort),
+      };
+    }
+    return base;
+  }
+
+  return base;
+}
+
+// ─── buildGenerationOptions (generalized egress) ────────────────────────────
+//
+// Capability-aware egress for the full GenerationIntent: reasoning (delegated to
+// buildReasoningOptionsForModel) plus the non-reasoning knobs that also need
+// model-aware handling:
+//
+//   - maxTokens   → clamped to model.maxTokens (omitting it lets pi-ai apply
+//                   the model default; an over-limit value would 400).
+//   - temperature → DROPPED when thinking is enabled or the model rejects it
+//                   (compat.supportsTemperature === false, e.g. Opus 4.7+).
+//                   Mirrors pi-ai's own anthropic guard so we never send a
+//                   value the provider will reject.
+//   - verbosity   → OpenAI-family only (textVerbosity).
+//   - serviceTier → capability-mapped for models declaring a serviceTierMap /
+//                   serviceTierFormat, legacy OpenAI-family pass-through
+//                   otherwise.
+
+export function buildGenerationOptions(
+  model: Pick<PiAiModel<any>, 'api' | 'reasoning' | 'thinkingLevelMap' | 'compat'> & {
+    maxTokens?: number;
+    id?: string;
+    /** Canonical service-tier capability map (see service-tier-selection.ts). */
+    serviceTierMap?: ServiceTierMap;
+  },
+  intent: GenerationIntent | undefined
+): Record<string, any> {
+  if (!intent) return {};
+  const api = model.api as string | undefined;
+  const opts: Record<string, any> = buildReasoningOptionsForModel(model, intent.reasoning);
+
+  // ── maxTokens: clamp to the model's advertised ceiling ───────────────────
+  if (intent.maxTokens != null && intent.maxTokens > 0) {
+    const ceiling =
+      typeof model.maxTokens === 'number' && model.maxTokens > 0 ? model.maxTokens : undefined;
+    opts.maxTokens = ceiling != null ? Math.min(intent.maxTokens, ceiling) : intent.maxTokens;
+  }
+
+  // ── temperature: incompatibility guards ───────────────────────────────
+  if (intent.temperature != null) {
+    const thinkingOn = opts.thinkingEnabled === true || opts.reasoningEffort != null;
+    const tempSupported =
+      (model.compat as { supportsTemperature?: boolean })?.supportsTemperature !== false;
+    const tempIncompatibleWithThinking = api === 'anthropic-messages' && thinkingOn;
+    if (tempSupported && !tempIncompatibleWithThinking) {
+      opts.temperature = intent.temperature;
+    }
+  }
+
+  // ── verbosity: OpenAI family only ──────────────────────────────────
+  if (intent.verbosity != null && isOpenAiFamily(api)) {
+    opts.textVerbosity = intent.verbosity;
+  }
+
+  // ── serviceTier: capability-mapped when declared, legacy pass-through otherwise ──
+  if (intent.serviceTier != null) {
+    const map = (model as { serviceTierMap?: ServiceTierMap }).serviceTierMap;
+    // Only a declared capability map engages the mapper. A lone format (or no
+    // config at all) preserves the legacy provider-native pass-through so we
+    // never break provider-specific controls we don't understand.
+    if (map) {
+      const explicitFormat = (model.compat as { serviceTierFormat?: ServiceTierFormat } | undefined)
+        ?.serviceTierFormat;
+      const format = explicitFormat ?? inferServiceTierFormat(api);
+      // No inferable wire shape (e.g. Gemini): the tier cannot be projected.
+      // Emit nothing rather than leak an unmappable value.
+      if (format === 'anthropic-speed' && api !== 'anthropic-messages') {
+        // `anthropic-speed` only has a wire spelling on the Anthropic Messages
+        // API. Any other declared combination is a configuration error: leave
+        // the body untouched rather than writing `speed` to an OpenAI body.
+        logger.warn(
+          `Ignoring serviceTierFormat 'anthropic-speed' for ${api ?? 'unknown'} model ` +
+            `${model.id ?? '<unidentified>'}: it is only supported on anthropic-messages`
+        );
+      } else if (format) {
+        const resolved = resolveServiceTier(intent.serviceTier, map, format);
+        if (resolved) {
+          // `null` is the projection's explicit "omit" signal; an unsupported
+          // tier must not leave the client's rejected value in the body.
+          opts.serviceTier = resolved.value ?? null;
+          opts.serviceTierFormat = format;
+        }
+      }
+    } else if (
+      isOpenAiFamily(api) &&
+      intent.serviceTierSource !== 'speed' &&
+      intent.serviceTierSource !== 'key_default'
+    ) {
+      // Legacy (unmapped) pass-through for EXPLICIT tiers only. A native
+      // Anthropic `speed` value is a different concept than a capacity
+      // `service_tier`, so it must not be translated into a raw OpenAI
+      // `service_tier` without a declared map. A per-key default is
+      // best-effort: with no declared support the provider may reject any
+      // value we send, so omit it (the caller strips the injected value and
+      // the provider native default applies) rather than guessing.
+      opts.serviceTier = legacyOpenAiServiceTier(intent.serviceTier);
+    }
+  }
+
+  return opts;
+}
+
+function isOpenAiFamily(api: string | undefined): boolean {
+  return (
+    api === 'openai-responses' ||
+    api === 'openai-codex-responses' ||
+    api === 'openai-completions' ||
+    api === 'azure-openai-responses'
+  );
+}
+
+/**
+ * Legacy (unmapped) OpenAI-family pass-through spellings. OpenAI's wire value
+ * for the standard tier is `default`, so translate the ModelMux/Anthropic
+ * `standard`/`standard_only` spellings instead of leaking them. `fast` is
+ * ModelMux's alias for `priority` and has no OpenAI wire spelling, so translate
+ * it as well — leaking `fast` makes OpenAI-compatible upstreams (e.g. Meta)
+ * reject the request with `unknown variant 'fast'`. OpenAI has no
+ * `ultrafast` capacity value, so decay it to the nearest same-idea tier
+ * `priority`. Provider-specific spellings we do not recognise (e.g. Google
+ * `on_demand`) are left verbatim rather than guessed at.
+ */
+const LEGACY_OPENAI_SERVICE_TIERS: Record<string, string> = {
+  standard: 'default',
+  standard_only: 'default',
+  fast: 'priority',
+  ultrafast: 'priority',
+};
+
+function legacyOpenAiServiceTier(tier: string): string {
+  return LEGACY_OPENAI_SERVICE_TIERS[tier.trim().toLowerCase()] ?? tier;
+}
+
+/**
+ * Resolve a pi-ai Model for a (provider, modelId) pair from the dynamic
+ * catalog (built-in baseline + pi.dev overlay). Returns null when unresolved.
+ */
+export function resolvePiAiModel(piAiProvider: string, piAiModelId: string): PiAiModel<any> | null {
+  return getCatalogModel(piAiProvider, piAiModelId);
+}
+
+// ─── Thinking signature validation ───────────────────────────────────────────
+//
+// pi-ai's openai-completions parser (ensureThinkingBlock) stamps a thinking
+// block's `thinkingSignature` with the *JSON field name* it matched
+// (`reasoning` | `reasoning_content` | `reasoning_text`) as soon as any
+// reasoning delta arrives — before it knows whether the provider will ever
+// send a real cryptographic signature via `reasoning_details[].signature`.
+// When a provider's `reasoning_details` entries don't match pi-ai's
+// `isEncryptedReasoningDetail` shape (Gemini-style {type, id, data}) — e.g.
+// Bedrock/OpenRouter's `{type: "reasoning.text", signature: "..."}` — the real
+// signature is never picked up, and this placeholder field-name string is all
+// that's left on the block. Forwarding it to a client as if it were a genuine
+// signature is worse than omitting it: a later replay to a provider that
+// actually validates signatures (e.g. Anthropic) is rejected outright with
+// "Invalid signature in thinking block", and it could just as easily be
+// mistaken for a signature from an entirely different provider.
+
+const THINKING_SIGNATURE_FIELD_NAME_PLACEHOLDERS = new Set([
+  'reasoning',
+  'reasoning_content',
+  'reasoning_text',
+]);
+
+/** True when `signature` is pi-ai's leftover field-name placeholder, not a real signature. */
+export function isPlaceholderThinkingSignature(signature: string | undefined): boolean {
+  return signature != null && THINKING_SIGNATURE_FIELD_NAME_PLACEHOLDERS.has(signature);
+}
