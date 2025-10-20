@@ -1,0 +1,452 @@
+import { beforeEach, describe, expect, it, mock, spyOn, test } from 'bun:test';
+
+import * as piAi from '@earendil-works/pi-ai';
+
+import type { ReasoningIntent } from '../reasoning';
+
+// buildReasoningOptionsForModel calls into pi-ai's clampThinkingLevel /
+// getSupportedThinkingLevels. The global mock in test/mocks.ts provides
+// a shared implementation, but this suite pins its own faithful copies that
+// honour thinkingLevelMap (mirroring pi-ai's real models.ts) so the tests stay
+// independent of the global mock's shape.
+beforeEach(() => {
+  const LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+  const getSupportedThinkingLevels = (model: any) => {
+    if (!model.reasoning) return ['off'];
+    return LEVELS.filter((level) => {
+      const mapped = model.thinkingLevelMap?.[level];
+      if (mapped === null) return false;
+      if (level === 'xhigh' || level === 'max') return mapped !== undefined;
+      return true;
+    });
+  };
+  const clampThinkingLevel = (model: any, level: string) => {
+    const avail = getSupportedThinkingLevels(model);
+    if (avail.includes(level)) return level;
+    const idx = LEVELS.indexOf(level as any);
+    if (idx === -1) return avail[0] ?? 'off';
+    for (let i = idx; i < LEVELS.length; i++) {
+      const c = LEVELS[i];
+      if (c && avail.includes(c)) return c;
+    }
+    for (let i = idx - 1; i >= 0; i--) {
+      const c = LEVELS[i];
+      if (c && avail.includes(c)) return c;
+    }
+    return avail[0] ?? 'off';
+  };
+  spyOn(piAi, 'getSupportedThinkingLevels').mockImplementation(getSupportedThinkingLevels as any);
+  spyOn(piAi, 'clampThinkingLevel').mockImplementation(clampThinkingLevel as any);
+});
+
+import type { GenerationIntent } from '../generation';
+import { buildGenerationOptions, buildReasoningOptionsForModel } from '../registry';
+
+const intent = (o: Partial<ReasoningIntent>): ReasoningIntent => ({ source: 'client', ...o });
+
+describe('buildReasoningOptionsForModel', () => {
+  describe('non-reasoning model', () => {
+    const model = { api: 'openai-completions', reasoning: false } as any;
+    it('never emits thinking params even when requested', () => {
+      expect(
+        buildReasoningOptionsForModel(model, intent({ effort: 'high', enabled: true }))
+      ).toEqual({});
+    });
+  });
+
+  describe('Layer 3: client said nothing → model default', () => {
+    it('emits nothing for a reasoning model when intent is empty', () => {
+      const model = { api: 'anthropic-messages', reasoning: true } as any;
+      expect(buildReasoningOptionsForModel(model, intent({}))).toEqual({});
+    });
+
+    it('emits nothing when intent is undefined', () => {
+      const model = { api: 'openai-responses', reasoning: true } as any;
+      expect(buildReasoningOptionsForModel(model, undefined)).toEqual({});
+    });
+  });
+
+  describe('OpenAI responses family', () => {
+    const model = { api: 'openai-responses', reasoning: true } as any;
+    it('maps effort to reasoningEffort', () => {
+      const opts = buildReasoningOptionsForModel(
+        model,
+        intent({ effort: 'medium', enabled: true })
+      );
+      expect(opts.reasoningEffort).toBe('medium');
+      expect(opts.reasoning).toBe('medium');
+    });
+    it('passes reasoningSummary when visibility requests a summary', () => {
+      const opts = buildReasoningOptionsForModel(
+        model,
+        intent({ effort: 'high', enabled: true, visibility: 'summary', summaryDetail: 'detailed' })
+      );
+      expect(opts.reasoningSummary).toBe('detailed');
+    });
+  });
+
+  describe("canonical 'max' effort", () => {
+    // gpt-5.6-style model: thinkingLevelMap explicitly supports max
+    const gpt56 = {
+      api: 'openai-responses',
+      reasoning: true,
+      thinkingLevelMap: {
+        off: 'none',
+        minimal: null,
+        low: 'low',
+        medium: 'medium',
+        high: 'high',
+        xhigh: 'xhigh',
+        max: 'max',
+      },
+    } as any;
+
+    it('round-trips a client max effort to a max egress level', () => {
+      const opts = buildReasoningOptionsForModel(gpt56, intent({ effort: 'max', enabled: true }));
+      expect(opts.reasoningEffort).toBe('max');
+      expect(opts.reasoning).toBe('max');
+    });
+
+    it('clamps max down when the model has no max level', () => {
+      const model = {
+        api: 'openai-responses',
+        reasoning: true,
+        thinkingLevelMap: { off: 'none', low: 'low', high: 'high', xhigh: 'xhigh' },
+      } as any;
+      const opts = buildReasoningOptionsForModel(model, intent({ effort: 'max', enabled: true }));
+      expect(opts.reasoningEffort).toBe('xhigh');
+    });
+  });
+
+  describe('Anthropic adaptive vs budget', () => {
+    it('adaptive model uses effort and maps xhigh via thinkingLevelMap', () => {
+      const model = {
+        api: 'anthropic-messages',
+        reasoning: true,
+        compat: { forceAdaptiveThinking: true },
+        thinkingLevelMap: { xhigh: 'max' },
+      } as any;
+      const opts = buildReasoningOptionsForModel(model, intent({ effort: 'xhigh', enabled: true }));
+      expect(opts.thinkingEnabled).toBe(true);
+      expect(opts.effort).toBe('xhigh');
+      expect(opts.thinkingBudgetTokens).toBeUndefined();
+    });
+
+    it('adaptive model + adaptive intent passes through with NO effort (model decides)', () => {
+      const model = {
+        api: 'anthropic-messages',
+        reasoning: true,
+        compat: { forceAdaptiveThinking: true },
+        thinkingLevelMap: { high: 'high', xhigh: 'max' },
+      } as any;
+      const opts = buildReasoningOptionsForModel(
+        model,
+        intent({ adaptive: true, enabled: true, visibility: 'summary' })
+      );
+      // True adaptive: thinking on, no effort pinned, model chooses magnitude.
+      expect(opts.thinkingEnabled).toBe(true);
+      expect(opts.effort).toBeUndefined();
+      expect(opts.thinkingBudgetTokens).toBeUndefined();
+      expect(opts.thinkingDisplay).toBe('summarized');
+      // No leftover streamSimple-compat reasoning level.
+      expect(opts.reasoning).toBeUndefined();
+    });
+
+    it('adaptive model + explicit effort still pins that effort (client committed)', () => {
+      const model = {
+        api: 'anthropic-messages',
+        reasoning: true,
+        compat: { forceAdaptiveThinking: true },
+        thinkingLevelMap: { high: 'high', xhigh: 'max' },
+      } as any;
+      const opts = buildReasoningOptionsForModel(
+        model,
+        intent({ adaptive: true, effort: 'xhigh', enabled: true })
+      );
+      expect(opts.thinkingEnabled).toBe(true);
+      expect(opts.effort).toBe('xhigh');
+    });
+
+    it('legacy (budget) model flattens an adaptive intent to the default-effort budget', () => {
+      const model = { api: 'anthropic-messages', reasoning: true } as any;
+      const opts = buildReasoningOptionsForModel(model, intent({ adaptive: true, enabled: true }));
+      // Non-adaptive model can't express "model decides" — flatten to the
+      // documented default effort (high → 16384 budget).
+      expect(opts.thinkingEnabled).toBe(true);
+      expect(opts.thinkingBudgetTokens).toBe(16384);
+    });
+
+    it('completions egress flattens an adaptive intent to the default effort (not none)', () => {
+      const model = { api: 'openai-completions', reasoning: true } as any;
+      const opts = buildReasoningOptionsForModel(model, intent({ adaptive: true, enabled: true }));
+      expect(opts.reasoningEffort).toBe('high');
+      expect(opts.reasoning).toBe('high');
+    });
+
+    it('legacy model uses budget tokens, round-tripping client budget', () => {
+      const model = { api: 'anthropic-messages', reasoning: true } as any;
+      const opts = buildReasoningOptionsForModel(
+        model,
+        intent({ effort: 'medium', budgetTokens: 12345, enabled: true })
+      );
+      expect(opts.thinkingEnabled).toBe(true);
+      expect(opts.thinkingBudgetTokens).toBe(12345);
+    });
+
+    it('legacy model derives budget from effort when none supplied', () => {
+      const model = { api: 'anthropic-messages', reasoning: true } as any;
+      const opts = buildReasoningOptionsForModel(model, intent({ effort: 'high', enabled: true }));
+      expect(opts.thinkingBudgetTokens).toBe(16384);
+    });
+  });
+
+  describe('Gemini level-based vs budget-based', () => {
+    it('level-based (Gemini 3) maps effort to provider level via thinkingLevelMap', () => {
+      const model = {
+        api: 'google-generative-ai',
+        reasoning: true,
+        thinkingLevelMap: { off: null, low: 'LOW', high: 'HIGH' },
+      } as any;
+      const opts = buildReasoningOptionsForModel(model, intent({ effort: 'high', enabled: true }));
+      expect(opts.thinking).toEqual({ enabled: true, includeThoughts: true, level: 'HIGH' });
+    });
+
+    it('budget-based (Gemini 2.x) sends budgetTokens', () => {
+      const model = { api: 'google-generative-ai', reasoning: true } as any;
+      const opts = buildReasoningOptionsForModel(
+        model,
+        intent({ effort: 'medium', budgetTokens: 4096, enabled: true })
+      );
+      expect(opts.thinking).toEqual({ enabled: true, includeThoughts: true, budgetTokens: 4096 });
+    });
+  });
+
+  describe('explicit disable', () => {
+    it('disables when the model supports off', () => {
+      const model = { api: 'anthropic-messages', reasoning: true } as any;
+      const opts = buildReasoningOptionsForModel(model, intent({ enabled: false }));
+      expect(opts.thinkingEnabled).toBe(false);
+    });
+
+    it('cannot-disable model clamps to lowest supported level instead', () => {
+      // gpt-5 style: off is null (unsupported), minimal supported
+      const model = {
+        api: 'openai-responses',
+        reasoning: true,
+        thinkingLevelMap: { off: null },
+      } as any;
+      const opts = buildReasoningOptionsForModel(model, intent({ enabled: false }));
+      // off is unsupported → clamp to lowest non-off supported level (minimal)
+      expect(opts.reasoningEffort).toBe('minimal');
+    });
+
+    it('anthropic cannot-disable model (like opus-5) clamps to low instead of minimal', () => {
+      const model = {
+        api: 'anthropic-messages',
+        reasoning: true,
+        thinkingLevelMap: { off: null, xhigh: 'xhigh', max: 'max' },
+        compat: { forceAdaptiveThinking: true },
+      } as any;
+      const opts = buildReasoningOptionsForModel(model, intent({ enabled: false }));
+      expect(opts.thinkingEnabled).toBe(true);
+      expect(opts.effort).toBe('low');
+    });
+  });
+
+  describe('clamping unsupported levels', () => {
+    it('clamps a requested level the model does not support', () => {
+      // Gemini 3 pro: only low + high supported (medium null)
+      const model = {
+        api: 'google-generative-ai',
+        reasoning: true,
+        thinkingLevelMap: { off: null, minimal: null, low: 'LOW', medium: null, high: 'HIGH' },
+      } as any;
+      const opts = buildReasoningOptionsForModel(
+        model,
+        intent({ effort: 'medium', enabled: true })
+      );
+      // medium unsupported → clamp up to high
+      expect(opts.thinking).toEqual({ enabled: true, includeThoughts: true, level: 'HIGH' });
+    });
+
+    it('clamps minimal effort to low for anthropic models with adaptive thinking', () => {
+      const model = {
+        api: 'anthropic-messages',
+        reasoning: true,
+        compat: { forceAdaptiveThinking: true },
+      } as any;
+      const opts = buildReasoningOptionsForModel(
+        model,
+        intent({ effort: 'minimal', enabled: true })
+      );
+      expect(opts.thinkingEnabled).toBe(true);
+      expect(opts.effort).toBe('low');
+    });
+  });
+});
+
+const gen = (o: Partial<GenerationIntent>): GenerationIntent => ({
+  reasoning: { source: 'client' },
+  ...o,
+});
+
+describe('buildGenerationOptions', () => {
+  describe('maxTokens clamping', () => {
+    it('clamps a request above the model ceiling', () => {
+      const model = { api: 'openai-completions', reasoning: false, maxTokens: 4096 } as any;
+      const opts = buildGenerationOptions(model, gen({ maxTokens: 100000 }));
+      expect(opts.maxTokens).toBe(4096);
+    });
+
+    it('passes a request below the ceiling untouched', () => {
+      const model = { api: 'openai-completions', reasoning: false, maxTokens: 4096 } as any;
+      const opts = buildGenerationOptions(model, gen({ maxTokens: 1000 }));
+      expect(opts.maxTokens).toBe(1000);
+    });
+
+    it('passes the request through when the model has no ceiling', () => {
+      const model = { api: 'openai-completions', reasoning: false } as any;
+      const opts = buildGenerationOptions(model, gen({ maxTokens: 9999 }));
+      expect(opts.maxTokens).toBe(9999);
+    });
+  });
+
+  describe('temperature guards', () => {
+    it('forwards temperature for a normal model', () => {
+      const model = { api: 'openai-completions', reasoning: false } as any;
+      const opts = buildGenerationOptions(model, gen({ temperature: 0.5 }));
+      expect(opts.temperature).toBe(0.5);
+    });
+
+    it('drops temperature when thinking is enabled on Anthropic', () => {
+      const model = { api: 'anthropic-messages', reasoning: true } as any;
+      const opts = buildGenerationOptions(
+        model,
+        gen({
+          temperature: 0.5,
+          reasoning: { effort: 'high', enabled: true, source: 'client' },
+        })
+      );
+      expect(opts.thinkingEnabled).toBe(true);
+      expect(opts.temperature).toBeUndefined();
+    });
+
+    it('drops temperature when the model rejects it (supportsTemperature=false)', () => {
+      const model = {
+        api: 'anthropic-messages',
+        reasoning: false,
+        compat: { supportsTemperature: false },
+      } as any;
+      const opts = buildGenerationOptions(model, gen({ temperature: 0.5 }));
+      expect(opts.temperature).toBeUndefined();
+    });
+  });
+
+  describe('verbosity and serviceTier', () => {
+    it('forwards verbosity + serviceTier for OpenAI-family models', () => {
+      const model = { api: 'openai-responses', reasoning: false } as any;
+      const opts = buildGenerationOptions(model, gen({ verbosity: 'high', serviceTier: 'flex' }));
+      expect(opts.textVerbosity).toBe('high');
+      expect(opts.serviceTier).toBe('flex');
+    });
+
+    it('drops verbosity + serviceTier for non-OpenAI models', () => {
+      const model = { api: 'anthropic-messages', reasoning: false } as any;
+      const opts = buildGenerationOptions(model, gen({ verbosity: 'high', serviceTier: 'flex' }));
+      expect(opts.textVerbosity).toBeUndefined();
+      expect(opts.serviceTier).toBeUndefined();
+    });
+
+    it('does not translate a native speed intent through a legacy unmapped OpenAI model', () => {
+      const model = { api: 'openai-completions', reasoning: false } as any;
+      const fromSpeed = buildGenerationOptions(
+        model,
+        gen({ serviceTier: 'fast', serviceTierSource: 'speed' })
+      );
+      expect(fromSpeed.serviceTier).toBeUndefined();
+
+      const fromCapacity = buildGenerationOptions(
+        model,
+        gen({ serviceTier: 'flex', serviceTierSource: 'service_tier' })
+      );
+      expect(fromCapacity.serviceTier).toBe('flex');
+    });
+
+    it.each(['standard', 'standard_only', 'STANDARD'])(
+      'normalizes the legacy %s tier to OpenAI default',
+      (tier) => {
+        const model = { api: 'openai-completions', reasoning: false } as any;
+        const opts = buildGenerationOptions(
+          model,
+          gen({ serviceTier: tier, serviceTierSource: 'suffix' })
+        );
+        expect(opts.serviceTier).toBe('default');
+      }
+    );
+
+    it('omits a key-default tier for legacy unmapped models but keeps explicit ones', () => {
+      const model = { api: 'openai-completions', reasoning: false } as any;
+      const omitted = buildGenerationOptions(
+        model,
+        gen({ serviceTier: 'fast', serviceTierSource: 'key_default' })
+      );
+      expect(omitted.serviceTier).toBeUndefined();
+      expect(omitted.serviceTierFormat).toBeUndefined();
+
+      const explicit = buildGenerationOptions(
+        model,
+        gen({ serviceTier: 'fast', serviceTierSource: 'suffix' })
+      );
+      expect(explicit.serviceTier).toBe('priority');
+    });
+
+    it('resolves a key-default tier through a declared serviceTierMap', () => {
+      const mapped = {
+        api: 'openai-completions',
+        reasoning: false,
+        serviceTierMap: { ultrafast: 'ultra', standard: 'default' },
+      } as any;
+      const opts = buildGenerationOptions(
+        mapped,
+        gen({ serviceTier: 'ultrafast', serviceTierSource: 'key_default' })
+      );
+      expect(opts.serviceTier).toBe('ultra');
+    });
+
+    it('leaves a provider-specific legacy tier spelling untouched', () => {
+      const model = { api: 'openai-responses', reasoning: false } as any;
+      const opts = buildGenerationOptions(
+        model,
+        gen({ serviceTier: 'on_demand', serviceTierSource: 'service_tier' })
+      );
+      expect(opts.serviceTier).toBe('on_demand');
+    });
+
+    it('maps a declared serviceTierMap and ignores anthropic-speed on OpenAI APIs', () => {
+      const mapped = {
+        api: 'openai-completions',
+        reasoning: false,
+        serviceTierMap: { priority: 'priority' },
+      } as any;
+      const opts = buildGenerationOptions(
+        mapped,
+        gen({ serviceTier: 'fast', serviceTierSource: 'speed' })
+      );
+      expect(opts.serviceTier).toBe('priority');
+      expect(opts.serviceTierFormat).toBe('service-tier');
+
+      const badConfig = {
+        api: 'openai-completions',
+        reasoning: false,
+        serviceTierMap: { priority: 'fast' },
+        compat: { serviceTierFormat: 'anthropic-speed' },
+      } as any;
+      const guarded = buildGenerationOptions(
+        badConfig,
+        gen({ serviceTier: 'fast', serviceTierSource: 'speed' })
+      );
+      expect(guarded.serviceTier).toBeUndefined();
+      expect(guarded.serviceTierFormat).toBeUndefined();
+    });
+  });
+});

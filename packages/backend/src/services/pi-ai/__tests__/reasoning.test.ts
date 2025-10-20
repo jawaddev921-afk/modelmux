@@ -1,0 +1,180 @@
+import { describe, expect, it } from 'bun:test';
+
+import {
+  budgetToEffort,
+  effortToBudget,
+  getReasoningLogValue,
+  intentToEffort,
+  normalizeEffort,
+  splitReasoningSuffix,
+} from '../reasoning';
+
+describe('normalizeEffort', () => {
+  it.each([
+    ['none', 'off'],
+    ['off', 'off'],
+    ['disabled', 'off'],
+    ['minimal', 'minimal'],
+    ['low', 'low'],
+    ['medium', 'medium'],
+    ['high', 'high'],
+    ['xhigh', 'xhigh'],
+    // 'max' is its own canonical level, not a synonym of 'xhigh'
+    ['max', 'max'],
+    ['maximum', 'max'],
+    ['MAX', 'max'],
+  ])('normalizes %s → %s', (raw, expected) => {
+    expect(normalizeEffort(raw)).toBe<unknown>(expected);
+  });
+
+  it('returns undefined for unknown values and non-strings', () => {
+    expect(normalizeEffort('turbo')).toBeUndefined();
+    expect(normalizeEffort(42)).toBeUndefined();
+    expect(normalizeEffort(undefined)).toBeUndefined();
+  });
+});
+
+describe('budgetToEffort', () => {
+  it('maps budget bands up through xhigh', () => {
+    expect(budgetToEffort(0)).toBe('off');
+    expect(budgetToEffort(1024)).toBe('minimal');
+    expect(budgetToEffort(2048)).toBe('low');
+    expect(budgetToEffort(8192)).toBe('medium');
+    expect(budgetToEffort(16384)).toBe('high');
+    expect(budgetToEffort(32768)).toBe('xhigh');
+  });
+
+  it('maps budgets above the xhigh band to max', () => {
+    expect(budgetToEffort(32769)).toBe('max');
+    expect(budgetToEffort(65536)).toBe('max');
+  });
+
+  it('round-trips stably through effortToBudget', () => {
+    for (const budget of [1024, 2048, 8192, 16384, 32768, 65536]) {
+      const effort = budgetToEffort(budget);
+      expect(effort).not.toBe('off');
+      expect(effortToBudget(effort as Exclude<typeof effort, 'off'>)).toBe(budget);
+    }
+  });
+});
+
+describe('splitReasoningSuffix', () => {
+  it('splits a :max suffix into a max-effort intent (not xhigh)', () => {
+    const { alias, intent } = splitReasoningSuffix('gpt-5.6-luna:max');
+    expect(alias).toBe('gpt-5.6-luna');
+    expect(intent).toEqual({ effort: 'max', enabled: true, source: 'client' });
+  });
+
+  it('leaves unknown suffixes intact', () => {
+    expect(splitReasoningSuffix('my-model:custom')).toEqual({ alias: 'my-model:custom' });
+  });
+});
+
+describe('getReasoningLogValue', () => {
+  it.each([
+    [{ reasoning_effort: 'low' }, undefined, 'low'],
+    [{ reasoning: { effort: 'max' } }, undefined, 'max'],
+    [{ thinking: { type: 'enabled', budget_tokens: 2048 } }, undefined, 'low'],
+    [{ generationConfig: { thinkingConfig: { thinkingLevel: 'HIGH' } } }, undefined, 'high'],
+    [{ reasoning: { enabled: true } }, undefined, 'on'],
+    [{ reasoning: { enabled: false } }, undefined, 'off'],
+    // A bare `thinking: { type: 'enabled' }` must not shadow an explicit effort.
+    [{ thinking: { type: 'enabled' }, reasoning_effort: 'medium' }, undefined, 'medium'],
+    [{ thinking: { type: 'enabled' }, reasoning: { effort: 'high' } }, undefined, 'high'],
+    [{ thinking: { type: 'enabled' } }, undefined, 'on'],
+    [{ thinking: { type: 'adaptive' } }, undefined, 'on'],
+    // Explicitly disabling thinking still wins over a conflicting effort.
+    [{ thinking: { type: 'disabled' }, reasoning_effort: 'medium' }, undefined, 'off'],
+    // A higher-priority enable must not be overridden by a lower-priority 'off'.
+    [{ thinking: { type: 'enabled' }, reasoning: { enabled: false } }, undefined, 'on'],
+    [
+      {
+        thinking: { type: 'enabled' },
+        generationConfig: { thinkingConfig: { thinkingBudget: 0 } },
+      },
+      undefined,
+      'on',
+    ],
+    // Gemini thinkingBudget maps -1 to 'auto' and 0 to 'off'
+    [{ generationConfig: { thinkingConfig: { thinkingBudget: -1 } } }, undefined, 'auto'],
+    [{ generationConfig: { thinkingConfig: { thinking_budget: -1 } } }, undefined, 'auto'],
+    [{ generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, undefined, 'off'],
+    [{ generationConfig: { thinkingConfig: { thinking_budget: 0 } } }, undefined, 'off'],
+    [{ reasoning_effort: 'auto' }, undefined, 'auto'],
+    [{}, { reasoning: { max_tokens: -1 } }, 'auto'],
+  ] as const)('extracts %s as %s', (payload, request, expected) => {
+    expect(getReasoningLogValue(request, payload)).toBe(expected);
+  });
+
+  it('prefers an explicit effort over a generic enabled signal from the request', () => {
+    expect(
+      getReasoningLogValue({ reasoning: { effort: 'medium' } }, { thinking: { type: 'enabled' } })
+    ).toBe('medium');
+  });
+
+  it('does not let a fallback off override an explicit enable', () => {
+    expect(
+      getReasoningLogValue({ reasoning: { enabled: false } }, { thinking: { type: 'enabled' } })
+    ).toBe('on');
+  });
+
+  it('falls back to the normalized request', () => {
+    expect(getReasoningLogValue({ reasoning: { effort: 'medium' } }, {})).toBe('medium');
+  });
+
+  it('does not report an unspecified reasoning setting', () => {
+    expect(getReasoningLogValue({}, {})).toBeUndefined();
+  });
+});
+
+describe('getReasoningLogValue with mid-conversation output_config', () => {
+  const body = (efforts: string[], topLevelEffort = 'low') => ({
+    thinking: { type: 'adaptive', display: 'summarized' },
+    output_config: { effort: topLevelEffort },
+    messages: [
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'hi' },
+      ...efforts.map((effort) => ({ role: 'system', content: [], output_config: { effort } })),
+    ],
+  });
+
+  it('reports the trailing mid-conversation effort, not the placeholder', () => {
+    expect(getReasoningLogValue(undefined, body(['low', 'high']))).toBe('high');
+  });
+
+  it('uses the last mid-conversation entry', () => {
+    expect(getReasoningLogValue(undefined, body(['high', 'medium']))).toBe('medium');
+  });
+
+  it('keeps the top-level effort when no mid-conversation entry exists', () => {
+    expect(getReasoningLogValue(undefined, body([], 'medium'))).toBe('medium');
+  });
+
+  it('applies without a thinking block', () => {
+    expect(
+      getReasoningLogValue(undefined, {
+        output_config: { effort: 'low' },
+        messages: [{ role: 'system', content: [], output_config: { effort: 'max' } }],
+      })
+    ).toBe('max');
+  });
+
+  it('still reports off when thinking is explicitly disabled', () => {
+    expect(
+      getReasoningLogValue(undefined, {
+        thinking: { type: 'disabled' },
+        messages: [{ role: 'system', content: [], output_config: { effort: 'high' } }],
+      })
+    ).toBe('off');
+  });
+});
+
+describe('intentToEffort', () => {
+  it('maps budgetTokens: -1 to adaptive default effort', () => {
+    expect(intentToEffort({ budgetTokens: -1, source: 'client' })).toBe('high');
+  });
+
+  it('maps budgetTokens: 0 to off', () => {
+    expect(intentToEffort({ budgetTokens: 0, source: 'client' })).toBe('off');
+  });
+});

@@ -1,0 +1,423 @@
+/**
+ * Canonical reasoning/thinking intent for pi-ai registry compatibility.
+ *
+ * Every inbound protocol (OpenAI chat, Anthropic messages, OpenAI Responses,
+ * Gemini) expresses "how much should the model think" differently:
+ *
+ *   - OpenAI chat / Responses : reasoning_effort | reasoning.effort  (effort string)
+ *   - Anthropic               : thinking.budget_tokens               (token budget)
+ *   - Gemini                  : thinkingConfig.thinkingLevel | thinkingBudget
+ *
+ * Rather than collapse all of these to a single lossy effort string at ingress
+ * (the old behaviour), each parser produces a `ReasoningIntent` that preserves
+ * the *richest* signal the client gave us:
+ *
+ *   - `effort`       : a normalized effort bucket, when the client spoke in buckets
+ *   - `budgetTokens` : the raw token budget, when the client spoke in tokens
+ *   - `enabled`      : tri-state. true = explicitly on, false = explicitly off,
+ *                      undefined = client said nothing → use the model default
+ *   - `summary`      : whether the client asked for a reasoning summary
+ *   - `source`       : provenance, for debugging / policy resolution
+ *
+ * The egress side (`registry.ts`) consumes this intent together with the
+ * resolved pi-ai model's capabilities to produce the correct per-provider
+ * request options. Preserving `budgetTokens` lets us round-trip the client's
+ * exact budget when the ingress and egress families match (e.g. Anthropic →
+ * Anthropic), instead of re-quantizing through a coarse bucket.
+ */
+
+/** pi-ai's thinking vocabulary. "off" means thinking disabled. */
+export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+/**
+ * Unified reasoning-output visibility, normalized across protocols:
+ *   - 'hidden'  → do not surface thinking (or client didn't ask)
+ *   - 'summary' → surface a summarized form of the reasoning
+ *   - 'full'    → surface raw reasoning where the provider allows it
+ *
+ * Maps from: OpenAI Responses `reasoning.summary`, Gemini
+ * `thinkingConfig.includeThoughts`, Anthropic `thinking` display semantics.
+ */
+export type ReasoningVisibility = 'hidden' | 'summary' | 'full';
+
+export interface ReasoningIntent {
+  /** Normalized effort bucket, when known. */
+  effort?: ReasoningEffort;
+  /** Raw token budget the client supplied, when known. Preserved for round-trip fidelity. */
+  budgetTokens?: number;
+  /**
+   * Tri-state thinking switch:
+   *   true      → client explicitly enabled thinking
+   *   false     → client explicitly disabled thinking
+   *   undefined → client said nothing; defer to the model's native default
+   */
+  enabled?: boolean;
+  /**
+   * Adaptive thinking: the client enabled reasoning but did NOT commit to a
+   * magnitude — the model decides how much to think (Anthropic
+   * `thinking.type: 'adaptive'`, the only mode on Claude 5+).
+   *
+   * On a native adaptive-thinking Anthropic egress this is passed through as
+   * `thinkingEnabled: true` with no `effort`, so the model chooses. On egress
+   * families that cannot express "let the model decide" (OpenAI-completions /
+   * OpenRouter, Gemini, legacy budget-based Anthropic) it resolves to the
+   * documented adaptive default effort via {@link intentToEffort}.
+   */
+  adaptive?: boolean;
+  /** Unified reasoning-output visibility (summary / full / hidden). */
+  visibility?: ReasoningVisibility;
+  /**
+   * OpenAI-specific summary granularity (`auto` | `concise` | `detailed`),
+   * preserved verbatim so an OpenAI→OpenAI route keeps the exact value.
+   */
+  summaryDetail?: string;
+  /** Where this intent came from. */
+  source: 'client' | 'header' | 'key' | 'alias' | 'default';
+}
+
+/**
+ * Ordered effort ladder, lowest → highest. Mirrors pi-ai's EXTENDED_THINKING
+ * levels minus "off" (which is represented by `enabled: false`).
+ */
+export const EFFORT_LADDER: readonly ReasoningEffort[] = [
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const;
+
+/**
+ * Single source of truth mapping an effort bucket → a representative token
+ * budget. Used when an effort-only client routes to a budget-based provider
+ * (e.g. Gemini 2.x). Kept as the exact inverse of {@link budgetToEffort} so
+ * round-tripping a value through both is stable.
+ */
+const EFFORT_TO_BUDGET: Record<ReasoningEffort, number> = {
+  minimal: 1024,
+  low: 2048,
+  medium: 8192,
+  high: 16384,
+  xhigh: 32768,
+  max: 65536,
+};
+
+export function effortToBudget(effort: ReasoningEffort): number {
+  return EFFORT_TO_BUDGET[effort] ?? EFFORT_TO_BUDGET.high;
+}
+
+/**
+ * Map a raw token budget → an effort bucket. Replaces the two divergent
+ * threshold tables that previously lived in `transformers/utils.ts`
+ * (`getThinkLevel`) and `gemini-to-context.ts`.
+ *
+ * A budget <= 0 means "disable thinking" and returns `'off'`.
+ */
+export function budgetToEffort(budget: number): ReasoningEffort | 'off' {
+  if (budget <= 0) return 'off';
+  if (budget <= 1024) return 'minimal';
+  if (budget <= 2048) return 'low';
+  if (budget <= 8192) return 'medium';
+  if (budget <= 16384) return 'high';
+  if (budget <= 32768) return 'xhigh';
+  return 'max';
+}
+
+/** Normalize an arbitrary client effort string to our vocabulary, if possible. */
+export function normalizeEffort(raw: unknown): ReasoningEffort | 'off' | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const v = raw.trim().toLowerCase();
+  switch (v) {
+    case 'none':
+    case 'off':
+    case 'disabled':
+      return 'off';
+    case 'minimal':
+      return 'minimal';
+    case 'low':
+      return 'low';
+    case 'medium':
+      return 'medium';
+    case 'high':
+      return 'high';
+    case 'xhigh':
+      return 'xhigh';
+    case 'max':
+    case 'maximum':
+      return 'max';
+    default:
+      return undefined;
+  }
+}
+
+export type ReasoningLogValue = ReasoningEffort | 'off' | 'on' | 'auto';
+
+function reasoningIntentToLogValue(intent: {
+  effort?: unknown;
+  budgetTokens?: unknown;
+  enabled?: unknown;
+  adaptive?: unknown;
+}): ReasoningLogValue | undefined {
+  if (intent.enabled === false) return 'off';
+
+  const rawEffort =
+    typeof intent.effort === 'string' ? intent.effort.trim().toLowerCase() : undefined;
+  if (rawEffort === 'auto') return 'auto';
+
+  const effort = normalizeEffort(intent.effort);
+  if (effort) return effort === 'off' ? 'off' : effort;
+
+  if (typeof intent.budgetTokens === 'number') {
+    if (intent.budgetTokens === -1) return 'auto';
+    const budgetEffort = budgetToEffort(intent.budgetTokens);
+    return budgetEffort === 'off' ? 'off' : budgetEffort;
+  }
+
+  if (intent.adaptive === true || intent.enabled === true) return 'on';
+  return undefined;
+}
+
+/**
+ * Resolve the per-turn effort an Anthropic Messages request actually runs with.
+ *
+ * With the `mid-conversation-output-config-2026-07-01` beta, a client can pin a
+ * fixed top-level `output_config.effort` (so the prompt cache stays valid) and
+ * instead express the effort for each turn as `output_config.effort` on entries
+ * inside `messages` (typically `role: 'system'`). Those entries are history: the
+ * LAST one is the effort applied to the turn being generated, and the top-level
+ * value is a placeholder that does not describe the request.
+ *
+ * Returns the raw effort from the last in-`messages` `output_config`, or
+ * `undefined` when the request carries none (so the caller keeps using the
+ * top-level `output_config.effort`).
+ */
+export function getMidConversationEffort(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object') return undefined;
+  const messages = (payload as { messages?: unknown }).messages;
+  if (!Array.isArray(messages)) return undefined;
+
+  let effort: string | undefined;
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue;
+    const outputConfig = (message as { output_config?: unknown }).output_config;
+    if (!outputConfig || typeof outputConfig !== 'object') continue;
+    const raw = (outputConfig as { effort?: unknown }).effort;
+    if (typeof raw === 'string' && raw.trim()) effort = raw;
+  }
+  return effort;
+}
+
+export function getReasoningLogValue(
+  request:
+    | {
+        reasoning?: {
+          effort?: unknown;
+          max_tokens?: unknown;
+          enabled?: unknown;
+          adaptive?: unknown;
+        };
+      }
+    | undefined,
+  payload: any
+): ReasoningLogValue | undefined {
+  const source = payload && typeof payload === 'object' ? payload : {};
+
+  // A source may tell us only that thinking is on, without a magnitude (e.g.
+  // a bare `thinking: { type: 'enabled' }`). Defer that generic 'on' instead of
+  // returning it immediately, so an explicit effort/budget elsewhere in the
+  // payload (e.g. a top-level `reasoning_effort`) is not shadowed.
+  let genericOn = false;
+  const resolve = (value: ReasoningLogValue | undefined): ReasoningLogValue | undefined => {
+    if (value === 'on') {
+      genericOn = true;
+      return undefined;
+    }
+    // Once a higher-priority source has enabled thinking, a lower-priority
+    // 'off' must not override it — only an explicit magnitude may refine it.
+    if (value === 'off' && genericOn) return undefined;
+    return value;
+  };
+
+  // A mid-conversation `output_config.effort` (see getMidConversationEffort)
+  // describes this turn; a top-level `output_config.effort` is a cache-stable
+  // placeholder in those requests, so the in-`messages` value takes precedence.
+  const midConversationEffort = getMidConversationEffort(source);
+  const outputEffort = midConversationEffort ?? source.output_config?.effort;
+
+  const thinking = source.thinking;
+  if (thinking && typeof thinking === 'object') {
+    const thinkingType =
+      typeof thinking.type === 'string' ? thinking.type.toLowerCase() : undefined;
+    const value = resolve(
+      reasoningIntentToLogValue({
+        effort: outputEffort,
+        budgetTokens: thinking.budget_tokens,
+        enabled: thinkingType === 'disabled' ? false : thinkingType ? true : undefined,
+        adaptive: thinkingType === 'adaptive',
+      })
+    );
+    if (value) return value;
+  }
+
+  const rawReasoning = source.reasoning;
+  if (rawReasoning && typeof rawReasoning === 'object') {
+    const value = resolve(
+      reasoningIntentToLogValue({
+        effort: rawReasoning.effort ?? rawReasoning.level,
+        budgetTokens: rawReasoning.max_tokens,
+        enabled: rawReasoning.enabled,
+        adaptive: rawReasoning.adaptive,
+      })
+    );
+    if (value) return value;
+  }
+
+  const chatEffortRaw =
+    typeof (source.reasoning_effort ?? source.reasoning_level) === 'string'
+      ? (source.reasoning_effort ?? source.reasoning_level).trim().toLowerCase()
+      : undefined;
+  if (chatEffortRaw === 'auto') return 'auto';
+  const chatEffort = normalizeEffort(chatEffortRaw);
+  if (chatEffort) return chatEffort === 'off' ? 'off' : chatEffort;
+
+  const thinkingConfig = source.generationConfig?.thinkingConfig;
+  if (thinkingConfig && typeof thinkingConfig === 'object') {
+    const thinkingBudget = thinkingConfig.thinkingBudget ?? thinkingConfig.thinking_budget;
+    const thinkingLevel = thinkingConfig.thinkingLevel ?? thinkingConfig.thinking_level;
+    const value = resolve(
+      reasoningIntentToLogValue({
+        effort: thinkingLevel,
+        budgetTokens: thinkingBudget,
+        enabled:
+          thinkingBudget === 0
+            ? false
+            : thinkingConfig.includeThoughts === true || thinkingConfig.include_thoughts === true
+              ? true
+              : undefined,
+      })
+    );
+    if (value) return value;
+  }
+
+  const value = resolve(
+    reasoningIntentToLogValue({
+      effort: outputEffort ?? source.thinking_level,
+      budgetTokens: source.budget_tokens ?? source.thinking_budget,
+      enabled: source.enable_thinking ?? source.chat_template_kwargs?.enable_thinking,
+    })
+  );
+  if (value) return value;
+
+  if (typeof source.model === 'string') {
+    const suffixIntent = splitReasoningSuffix(source.model).intent;
+    const suffixValue = suffixIntent ? resolve(reasoningIntentToLogValue(suffixIntent)) : undefined;
+    if (suffixValue) return suffixValue;
+  }
+
+  const requestValue = resolve(
+    reasoningIntentToLogValue({
+      effort: request?.reasoning?.effort,
+      budgetTokens: request?.reasoning?.max_tokens,
+      enabled: request?.reasoning?.enabled,
+      adaptive: request?.reasoning?.adaptive,
+    })
+  );
+  if (requestValue) return requestValue;
+
+  return genericOn ? 'on' : undefined;
+}
+
+/**
+ * Normalize a client-supplied visibility expression to our vocabulary.
+ * Accepts OpenAI summary strings, Anthropic display strings, and booleans.
+ */
+export function normalizeVisibility(raw: unknown): ReasoningVisibility | undefined {
+  if (raw === true) return 'summary';
+  if (raw === false) return 'hidden';
+  if (typeof raw !== 'string') return undefined;
+  const v = raw.trim().toLowerCase();
+  switch (v) {
+    case 'hidden':
+    case 'none':
+    case 'off':
+      return 'hidden';
+    case 'summary':
+    case 'summarized':
+    case 'concise':
+    case 'detailed':
+    case 'auto':
+      return 'summary';
+    case 'full':
+    case 'raw':
+    case 'all':
+      return 'full';
+    default:
+      return undefined;
+  }
+}
+
+/** Clamp an effort to a [floor, ceiling] window on the effort ladder. */
+export function clampEffortToWindow(
+  effort: ReasoningEffort,
+  floor?: ReasoningEffort,
+  ceiling?: ReasoningEffort
+): ReasoningEffort {
+  let idx = EFFORT_LADDER.indexOf(effort);
+  if (idx === -1) return effort;
+  if (floor) {
+    const f = EFFORT_LADDER.indexOf(floor);
+    if (f > idx) idx = f;
+  }
+  if (ceiling) {
+    const c = EFFORT_LADDER.indexOf(ceiling);
+    if (c !== -1 && c < idx) idx = c;
+  }
+  return EFFORT_LADDER[idx] ?? effort;
+}
+
+/**
+ * Default effort for adaptive thinking when it must be flattened to a concrete
+ * bucket (egress families that cannot express "let the model decide"). Matches
+ * the documented adaptive default, e.g. OpenRouter Claude 5: "adaptive thinking
+ * on at effort high".
+ */
+export const ADAPTIVE_DEFAULT_EFFORT: ReasoningEffort = 'high';
+
+/**
+ * Resolve a ReasoningIntent to a concrete effort bucket (or 'off'), using
+ * `budgetTokens` when no explicit `effort` was given.
+ */
+export function intentToEffort(intent: ReasoningIntent): ReasoningEffort | 'off' | undefined {
+  if (intent.enabled === false) return 'off';
+  if (intent.effort) return intent.effort;
+  if (intent.budgetTokens === -1 || intent.adaptive) return ADAPTIVE_DEFAULT_EFFORT;
+  if (intent.budgetTokens != null) return budgetToEffort(intent.budgetTokens);
+  // Adaptive: model-decides-magnitude, flattened to the documented default for
+  // egress paths that require a concrete effort.
+  if (intent.enabled === true) return 'medium'; // enabled but unspecified magnitude
+  return undefined;
+}
+
+/**
+ * Split a trailing `:effort` suffix off a model alias.
+ *
+ * Returns the bare alias plus an intent when a recognised suffix is present
+ * (`:off|minimal|low|medium|high|xhigh|max`). Unknown suffixes are left intact
+ * on the alias (they may be a legitimate part of the model name).
+ */
+export function splitReasoningSuffix(modelAlias: string): {
+  alias: string;
+  intent?: ReasoningIntent;
+} {
+  const idx = modelAlias.lastIndexOf(':');
+  if (idx <= 0 || idx === modelAlias.length - 1) return { alias: modelAlias };
+  const suffix = modelAlias.slice(idx + 1);
+  const effort = normalizeEffort(suffix);
+  if (effort === undefined) return { alias: modelAlias };
+  const alias = modelAlias.slice(0, idx);
+  if (effort === 'off') {
+    return { alias, intent: { enabled: false, source: 'client' } };
+  }
+  return { alias, intent: { effort, enabled: true, source: 'client' } };
+}
