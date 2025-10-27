@@ -1,0 +1,1625 @@
+import type { PiAiQuirks } from '@modelmux/shared';
+
+import { clampAnthropicEffortAndThinking } from '../../transformers/anthropic/thinking-clamp';
+import { projectReasoningForResponses } from '../../transformers/utils';
+import type { UnifiedChatRequest } from '../../types/unified';
+import { getApiBaseType } from '../../utils/api-format';
+import { logger } from '../../utils/logger';
+import type { GenerationIntent } from '../pi-ai/generation';
+import { normalizeVerbosity } from '../pi-ai/generation';
+import type { ReasoningIntent, ReasoningVisibility } from '../pi-ai/reasoning';
+import { clampEffortToWindow, normalizeEffort, normalizeVisibility } from '../pi-ai/reasoning';
+import { buildGenerationOptions, resolvePiAiModel } from '../pi-ai/registry';
+import type { RouteResult } from '../routing/router';
+import { LITE_ALLOWED_TOOL_TYPES } from './responses-extensions';
+import {
+  getDefaultServiceTier,
+  hasExplicitTier,
+  SERVICE_TIER_API_TYPES,
+  stripKeyDefaultTier,
+} from './service-tier-selection';
+
+function hasOwn(value: Record<string, any>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function normalizeReasoningFromUnified(
+  reasoning: UnifiedChatRequest['reasoning']
+): ReasoningIntent {
+  const effort = normalizeEffort(reasoning?.effort);
+  const enabled = effort === 'off' ? false : reasoning?.enabled;
+  const visibility = normalizeVisibility(reasoning?.summary);
+  return {
+    ...(effort && effort !== 'off' ? { effort } : {}),
+    ...(reasoning?.max_tokens != null ? { budgetTokens: reasoning.max_tokens } : {}),
+    ...(enabled !== undefined ? { enabled } : {}),
+    ...(reasoning?.adaptive ? { adaptive: true } : {}),
+    ...(visibility ? { visibility } : {}),
+    ...(reasoning?.summary ? { summaryDetail: reasoning.summary } : {}),
+    source: 'client',
+  };
+}
+
+function extractReasoningIntent(payload: any, request: UnifiedChatRequest): ReasoningIntent {
+  const source = payload && typeof payload === 'object' ? payload : {};
+  const incomingApiType = request.incomingApiType?.toLowerCase();
+
+  if (incomingApiType === 'messages' && source.thinking && typeof source.thinking === 'object') {
+    const thinking = source.thinking;
+    const type = typeof thinking.type === 'string' ? thinking.type.toLowerCase() : undefined;
+    const display = thinking.display;
+    return {
+      ...(type === 'disabled' ? { enabled: false } : { enabled: true }),
+      ...(type === 'adaptive' ? { adaptive: true } : {}),
+      ...(typeof thinking.budget_tokens === 'number'
+        ? { budgetTokens: thinking.budget_tokens }
+        : {}),
+      ...(normalizeVisibility(display) ? { visibility: normalizeVisibility(display) } : {}),
+      source: 'client',
+    };
+  }
+
+  const rawReasoning = source.reasoning ?? request.reasoning;
+  if (rawReasoning && typeof rawReasoning === 'object') {
+    const effort = normalizeEffort((rawReasoning as any).effort);
+    const summaryDetail =
+      typeof (rawReasoning as any).summary === 'string' ? (rawReasoning as any).summary : undefined;
+    const visibility = normalizeVisibility(summaryDetail);
+    return {
+      ...(effort === 'off' ? {} : effort ? { effort } : {}),
+      ...(effort === 'off' ? { enabled: false } : {}),
+      ...(typeof (rawReasoning as any).max_tokens === 'number'
+        ? { budgetTokens: (rawReasoning as any).max_tokens }
+        : {}),
+      ...((rawReasoning as any).enabled !== undefined
+        ? { enabled: (rawReasoning as any).enabled === true }
+        : {}),
+      ...(visibility ? { visibility } : {}),
+      ...(summaryDetail ? { summaryDetail } : {}),
+      source: 'client',
+    };
+  }
+
+  const chatEffort = normalizeEffort(source.reasoning_effort);
+  if (chatEffort) {
+    return chatEffort === 'off'
+      ? { enabled: false, source: 'client' }
+      : { effort: chatEffort, enabled: true, source: 'client' };
+  }
+
+  const thinkingConfig = source.generationConfig?.thinkingConfig;
+  if (thinkingConfig && typeof thinkingConfig === 'object') {
+    const thinkingBudget = thinkingConfig.thinkingBudget ?? thinkingConfig.thinking_budget;
+    const thinkingLevel = thinkingConfig.thinkingLevel ?? thinkingConfig.thinking_level;
+    const effort = normalizeEffort(thinkingLevel);
+    const visibility: ReasoningVisibility | undefined =
+      thinkingConfig.includeThoughts === true ? 'summary' : undefined;
+    return {
+      ...(effort && effort !== 'off' ? { effort } : {}),
+      ...(typeof thinkingBudget === 'number' ? { budgetTokens: thinkingBudget } : {}),
+      ...(thinkingBudget === 0 ? { enabled: false } : { enabled: true }),
+      ...(thinkingBudget === -1 ? { adaptive: true } : {}),
+      ...(visibility ? { visibility } : {}),
+      source: 'client',
+    };
+  }
+
+  return normalizeReasoningFromUnified(request.reasoning);
+}
+
+function extractGenerationIntent(payload: any, request: UnifiedChatRequest): GenerationIntent {
+  const source = payload && typeof payload === 'object' ? payload : {};
+  const maxTokens =
+    source.max_output_tokens ??
+    source.max_tokens ??
+    source.max_completion_tokens ??
+    source.generationConfig?.maxOutputTokens ??
+    request.max_tokens;
+  const temperature =
+    source.temperature ?? source.generationConfig?.temperature ?? request.temperature;
+  const verbosity = normalizeVerbosity(source.text?.verbosity ?? request.text?.verbosity);
+  // Native Anthropic Messages carries BOTH `speed` (fast mode) and
+  // `service_tier` (capacity). `speed` is the more specific tier intent, so it
+  // wins; the projection preserves `service_tier` independently.
+  const serviceTierIntent = pickServiceTierIntent(request, source);
+
+  return {
+    reasoning: extractReasoningIntent(
+      request.originalBody && request.incomingApiType?.toLowerCase() !== 'messages'
+        ? request.originalBody
+        : source,
+      request
+    ),
+    ...(typeof maxTokens === 'number' ? { maxTokens } : {}),
+    ...(typeof temperature === 'number' ? { temperature } : {}),
+    ...(verbosity ? { verbosity } : {}),
+    ...(serviceTierIntent
+      ? { serviceTier: serviceTierIntent.value, serviceTierSource: serviceTierIntent.source }
+      : {}),
+  };
+}
+
+/**
+ * Pick the single most-specific tier intent from a body plus the `@<tier>`
+ * suffix, recording where it came from. The `speed` field is checked before
+ * `service_tier` so native Anthropic fast mode beats a co-sent capacity tier.
+ *
+ * The per-key default is used only when the client supplied no tier. Preserve
+ * its canonical spelling when the legacy writer has already emitted a wire
+ * alias into the payload. Key defaults are tagged `key_default` (not
+ * `service_tier`) so egress can treat them as best-effort: mapped targets
+ * resolve them through the capability map, unmapped targets strip them
+ * instead of leaking a tier the provider may reject.
+ */
+function pickServiceTierIntent(
+  request: UnifiedChatRequest,
+  source: Record<string, any>
+): { value: string; source: 'suffix' | 'speed' | 'service_tier' | 'key_default' } | undefined {
+  if (typeof request.serviceTier === 'string') {
+    return { value: request.serviceTier, source: 'suffix' };
+  }
+
+  const originalBody = request.originalBody;
+  const keyDefault = getDefaultServiceTier(request);
+
+  // Lowest precedence: the per-key default. When the original client body
+  // records no explicit tier it is the only genuine intent; returning the
+  // canonical value before inspecting the payload keeps a legacy-injected wire
+  // alias from hiding `ultrafast`/`standard` from a serviceTierMap.
+  if (keyDefault && originalBody && !hasExplicitTier(originalBody)) {
+    return { value: keyDefault, source: 'key_default' };
+  }
+
+  const candidates: Array<[unknown, 'speed' | 'service_tier']> = [
+    [source.speed, 'speed'],
+    [source.service_tier, 'service_tier'],
+    [originalBody?.speed, 'speed'],
+    [originalBody?.service_tier, 'service_tier'],
+  ];
+  for (const [value, tierSource] of candidates) {
+    if (typeof value === 'string' && value.length > 0) {
+      return { value, source: tierSource };
+    }
+  }
+
+  if (keyDefault) return { value: keyDefault, source: 'key_default' };
+  return undefined;
+}
+
+function mappedThinkingValue(model: any, effort: string | undefined): string | undefined {
+  if (!effort) return undefined;
+  const mapped = model.thinkingLevelMap?.[effort];
+  return typeof mapped === 'string' ? mapped : effort;
+}
+
+function mappedOffValue(model: any): string | undefined {
+  const off = model.thinkingLevelMap?.off;
+  return typeof off === 'string' ? off : undefined;
+}
+
+function shouldDropTemperature(intent: GenerationIntent, options: Record<string, any>): boolean {
+  return intent.temperature != null && !hasOwn(options, 'temperature');
+}
+
+/**
+ * Write a resolved service tier into an OpenAI-compatible body. `service_tier`
+ * is the only wire spelling these dialects have; an `anthropic-speed` format is
+ * never valid here (guarded in the registry) and is ignored defensively.
+ *
+ * A native Anthropic `speed` that supplied the tier intent has no OpenAI
+ * spelling: strip it so the projected `service_tier` is not accompanied by a
+ * contradictory cross-dialect control.
+ */
+function projectOpenAiServiceTier(
+  next: Record<string, any>,
+  options: Record<string, any>,
+  source: GenerationIntent['serviceTierSource']
+): void {
+  if (options.serviceTier === undefined) return;
+  if (options.serviceTierFormat === 'anthropic-speed') return;
+  if (source === 'speed' || source === 'suffix') delete next.speed;
+  if (options.serviceTier === null) delete next.service_tier;
+  else next.service_tier = options.serviceTier;
+}
+
+/**
+ * The only `service_tier` values native Anthropic Messages recognises as the
+ * independent capacity control. Anything else is a cross-dialect canonical
+ * tier (OpenAI `priority`/`flex`, Google `on_demand`, ...) and must not leak
+ * alongside native `speed`.
+ */
+const ANTHROPIC_NATIVE_SERVICE_TIERS = new Set(['auto', 'standard_only']);
+
+/**
+ * Write a resolved service tier into an Anthropic Messages body. The
+ * `service-tier` format (e.g. OpenRouter's Anthropic-compatible endpoint) uses
+ * `service_tier`; the native `anthropic-speed` format uses `speed`. Native
+ * `speed` and the capacity `service_tier` are independent, so projecting one
+ * never clears the other — but each is only written in its native spelling:
+ *
+ *   - `service-tier`: a native `speed` that supplied the intent is cleared so
+ *     the fast-mode beta is not emitted alongside the projected tier.
+ *   - `anthropic-speed`: `service_tier` survives only when it is a real native
+ *     capacity value (`auto`/`standard_only`); a canonical OpenAI value would
+ *     contradict the projected `speed` and is dropped.
+ */
+function projectAnthropicServiceTier(
+  next: Record<string, any>,
+  options: Record<string, any>,
+  source: GenerationIntent['serviceTierSource']
+): void {
+  if (options.serviceTier === undefined) return;
+  if (options.serviceTierFormat === 'service-tier') {
+    if (source === 'speed' || source === 'suffix') delete next.speed;
+    if (options.serviceTier === null) delete next.service_tier;
+    else next.service_tier = options.serviceTier;
+    return;
+  }
+  // anthropic-speed: only `speed` is written; an independently valid native
+  // capacity `service_tier` stays, cross-dialect noise is cleared.
+  if (
+    typeof next.service_tier === 'string' &&
+    !ANTHROPIC_NATIVE_SERVICE_TIERS.has(next.service_tier.trim().toLowerCase())
+  ) {
+    delete next.service_tier;
+  }
+  if (options.serviceTier === null) delete next.speed;
+  else next.speed = options.serviceTier;
+}
+
+function projectOpenAiCompletionsAutoCompat(
+  payload: Record<string, any>,
+  request: UnifiedChatRequest,
+  model: any,
+  intent: GenerationIntent,
+  options: Record<string, any>
+): Record<string, any> {
+  const next = { ...payload };
+  const compat = model.compat ?? {};
+
+  if (options.maxTokens != null) {
+    if (compat.maxTokensField === 'max_completion_tokens') {
+      delete next.max_tokens;
+      next.max_completion_tokens = options.maxTokens;
+    } else {
+      delete next.max_completion_tokens;
+      next.max_tokens = options.maxTokens;
+    }
+  }
+  if (hasOwn(options, 'temperature')) next.temperature = options.temperature;
+  else if (shouldDropTemperature(intent, options)) delete next.temperature;
+
+  // Mapped service tier: write the native value, or strip an unsupported one so
+  // the client's rejected tier cannot leak upstream. Legacy (unmapped) models
+  // keep pass-through for explicit tiers; key defaults were stripped up front
+  // and the registry omits them, so an unsupported default can never leak.
+  projectOpenAiServiceTier(next, options, intent.serviceTierSource);
+
+  if (!model.reasoning) return next;
+
+  const reasoningEffort =
+    typeof options.reasoningEffort === 'string' ? options.reasoningEffort : undefined;
+  const enabled = reasoningEffort != null;
+  const explicitOff = options.reasoning === 'off' || intent.reasoning.enabled === false;
+  if (!enabled && !explicitOff) return next;
+
+  const mapped = mappedThinkingValue(model, reasoningEffort);
+  const off = mappedOffValue(model);
+  // A client-side `reasoning` object is the AUTHORITATIVE intent source
+  // (extractReasoningIntent checks it before reasoning_effort), so when it is
+  // present a leftover reasoning_effort may contradict the intent we are about
+  // to translate — count it as stale no matter what the branch writes. Mirror
+  // the extractor's nullish fallback to request.reasoning; malformed non-object
+  // values remain ignored and must not make the effort look stale.
+  const resolvedReasoning = next.reasoning ?? request.reasoning;
+  const hadReasoningObject =
+    resolvedReasoning != null &&
+    typeof resolvedReasoning === 'object' &&
+    !Array.isArray(resolvedReasoning);
+
+  // The switch below translated the client's reasoning intent into the
+  // target provider's dialect. Each case also DELETEs the OpenAI-style
+  // spellings the dialect does not consume (`reasoning` object and/or
+  // top-level `reasoning_effort`) so a strict upstream (the Meta Model API
+  // hard-400s on unknown fields) never receives the leftover untranslated
+  // notation alongside the translated one.
+  switch (compat.thinkingFormat) {
+    case 'zai':
+      next.thinking = enabled ? { type: 'enabled', clear_thinking: false } : { type: 'disabled' };
+      delete next.reasoning;
+      delete next.reasoning_effort;
+      if (enabled && compat.supportsReasoningEffort && mapped) next.reasoning_effort = mapped;
+      break;
+    case 'qwen':
+      next.enable_thinking = enabled;
+      delete next.reasoning;
+      delete next.reasoning_effort;
+      break;
+    case 'qwen-chat-template':
+      next.chat_template_kwargs = {
+        ...(next.chat_template_kwargs ?? {}),
+        enable_thinking: enabled,
+        preserve_thinking: true,
+      };
+      delete next.reasoning;
+      delete next.reasoning_effort;
+      break;
+    case 'chat-template':
+      next.chat_template_kwargs = {
+        ...(next.chat_template_kwargs ?? {}),
+        ...resolveChatTemplateKwargs(model, options),
+      };
+      delete next.reasoning;
+      delete next.reasoning_effort;
+      break;
+    case 'deepseek':
+      next.thinking = enabled ? { type: 'enabled' } : { type: 'disabled' };
+      delete next.reasoning;
+      delete next.reasoning_effort;
+      if (enabled && compat.supportsReasoningEffort && mapped) next.reasoning_effort = mapped;
+      break;
+    case 'openrouter':
+      // Overwrites `reasoning` wholesale; stale top-level `reasoning_effort`
+      // is removed so OpenRouter's dialect is the single source of intent.
+      next.reasoning = enabled ? { effort: mapped } : { effort: off ?? 'none' };
+      delete next.reasoning_effort;
+      break;
+    case 'ant-ling':
+      // Ant-ling can only express ENABLE with a mapped effort — when the
+      // intent is disable (or unexpressible) the only safe translation is to
+      // drop the unified notation entirely rather than leak it upstream.
+      // (mirrors pi-ai's ant-ling branch, which writes from scratch)
+      delete next.reasoning;
+      delete next.reasoning_effort;
+      if (enabled && mapped) next.reasoning = { effort: mapped };
+      break;
+    case 'together':
+      // Together natively consumes BOTH notations — nothing to strip.
+      next.reasoning = { enabled };
+      if (enabled && compat.supportsReasoningEffort && mapped) next.reasoning_effort = mapped;
+      break;
+    case 'string-thinking':
+      next.thinking = enabled ? mapped : (off ?? 'none');
+      delete next.reasoning;
+      delete next.reasoning_effort;
+      break;
+    default:
+      delete next.reasoning;
+      if (enabled && compat.supportsReasoningEffort && mapped) {
+        next.reasoning_effort = mapped;
+      } else if (!enabled && compat.supportsReasoningEffort && off) {
+        next.reasoning_effort = off;
+      } else if (compat.supportsReasoningEffort === false || hadReasoningObject) {
+        // Strip when the dialect provably lacks support, or when a translated
+        // reasoning object was the authoritative intent (a surviving
+        // reasoning_effort could contradict it).
+        // When support is merely UNKNOWN and no reasoning object was deleted,
+        // reasoning_effort was itself the intent source — pass it through:
+        // this branch IS the native OpenAI dialect, where the field stands a
+        // good chance of working.
+        delete next.reasoning_effort;
+      }
+      break;
+  }
+
+  return next;
+}
+
+function resolveChatTemplateKwargs(model: any, options: Record<string, any>): Record<string, any> {
+  const kwargs: Record<string, any> = {};
+  const template = model.compat?.chatTemplateKwargs;
+  if (!template || typeof template !== 'object') return kwargs;
+
+  for (const [key, value] of Object.entries(template)) {
+    const resolved = resolveChatTemplateKwargValue(model, options, value);
+    if (resolved !== undefined) kwargs[key] = resolved;
+  }
+  return kwargs;
+}
+
+function resolveChatTemplateKwargValue(model: any, options: Record<string, any>, value: unknown) {
+  if (typeof value !== 'object' || value === null) return value;
+  const config = value as { $var?: string; omitWhenOff?: boolean };
+  const reasoningEffort =
+    typeof options.reasoningEffort === 'string' ? options.reasoningEffort : undefined;
+  if (!reasoningEffort && config.omitWhenOff) return undefined;
+  if (config.$var === 'thinking.enabled') return !!reasoningEffort;
+  const mapped = reasoningEffort
+    ? model.thinkingLevelMap?.[reasoningEffort]
+    : model.thinkingLevelMap?.off;
+  return mapped === undefined ? reasoningEffort : typeof mapped === 'string' ? mapped : undefined;
+}
+
+function projectResponsesAutoCompat(
+  payload: Record<string, any>,
+  model: any,
+  intent: GenerationIntent,
+  options: Record<string, any>
+): Record<string, any> {
+  const next = { ...payload };
+  if (options.maxTokens != null) next.max_output_tokens = options.maxTokens;
+  if (hasOwn(options, 'temperature')) next.temperature = options.temperature;
+  else if (shouldDropTemperature(intent, options)) delete next.temperature;
+  projectOpenAiServiceTier(next, options, intent.serviceTierSource);
+  if (options.textVerbosity !== undefined) {
+    next.text = { ...(next.text ?? {}), verbosity: options.textVerbosity };
+  }
+  const existingReasoning = projectReasoningForResponses(next.reasoning);
+  if (options.reasoningEffort || options.reasoningSummary) {
+    next.reasoning = {
+      ...(existingReasoning ?? {}),
+      effort: mappedThinkingValue(model, options.reasoningEffort) ?? 'medium',
+      summary: options.reasoningSummary ?? existingReasoning?.summary ?? 'auto',
+    };
+    next.include = Array.from(
+      new Set([...(Array.isArray(next.include) ? next.include : []), 'reasoning.encrypted_content'])
+    );
+  } else if (options.reasoning === 'off') {
+    next.reasoning = { ...(existingReasoning ?? {}), effort: mappedOffValue(model) ?? 'none' };
+  }
+  return next;
+}
+
+function projectAnthropicAutoCompat(
+  payload: Record<string, any>,
+  model: any,
+  intent: GenerationIntent,
+  options: Record<string, any>,
+  inline = false
+): Record<string, any> {
+  const next = { ...payload };
+  if (options.maxTokens != null) next.max_tokens = options.maxTokens;
+  if (hasOwn(options, 'temperature')) next.temperature = options.temperature;
+  else if (shouldDropTemperature(intent, options)) delete next.temperature;
+
+  // Anthropic fast mode: `speed` + the fast-mode beta header are the mapped
+  // shape for the native dialect. The `service-tier` format writes
+  // `service_tier` instead (OpenRouter-style Messages). In both cases the
+  // other, independent Anthropic control is left untouched.
+  projectAnthropicServiceTier(next, options, intent.serviceTierSource);
+
+  if (options.thinkingEnabled === true) {
+    const display = options.thinkingDisplay ?? 'summarized';
+    if (model.compat?.forceAdaptiveThinking === true) {
+      next.thinking = { type: 'adaptive', display };
+      if (options.effort) {
+        const clampedEffort = clampEffortToWindow(options.effort, 'low', 'max');
+        next.output_config = { ...(next.output_config ?? {}), effort: clampedEffort };
+      }
+    } else {
+      next.thinking = {
+        type: 'enabled',
+        budget_tokens: options.thinkingBudgetTokens ?? 1024,
+        display,
+      };
+    }
+  } else if (options.thinkingEnabled === false) {
+    next.thinking = { type: 'disabled' };
+    if (next.output_config?.effort) {
+      delete next.output_config.effort;
+      if (Object.keys(next.output_config).length === 0) delete next.output_config;
+    }
+  }
+
+  return inline ? next : clampAnthropicEffortAndThinking(next, model.id);
+}
+
+function projectGeminiAutoCompat(
+  payload: Record<string, any>,
+  intent: GenerationIntent,
+  options: Record<string, any>
+): Record<string, any> {
+  const next = { ...payload, generationConfig: { ...(payload.generationConfig ?? {}) } };
+  if (options.maxTokens != null) next.generationConfig.maxOutputTokens = options.maxTokens;
+  if (hasOwn(options, 'temperature')) next.generationConfig.temperature = options.temperature;
+  else if (shouldDropTemperature(intent, options)) delete next.generationConfig.temperature;
+
+  if (options.thinking?.enabled === true) {
+    next.generationConfig.thinkingConfig = {
+      includeThoughts: options.thinking.includeThoughts !== false,
+      ...(options.thinking.level !== undefined ? { thinkingLevel: options.thinking.level } : {}),
+      ...(options.thinking.budgetTokens !== undefined
+        ? { thinkingBudget: options.thinking.budgetTokens }
+        : {}),
+    };
+  } else if (options.thinking?.enabled === false) {
+    next.generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  }
+
+  return next;
+}
+
+type InlineQuirk = NonNullable<PiAiQuirks[keyof PiAiQuirks]>;
+
+/** Resolve only declared traits; a model map replaces the common map, not its entries. */
+export function resolveInlineQuirks(
+  quirks: PiAiQuirks | undefined,
+  targetApiType: string,
+  modelId: string
+): Omit<InlineQuirk, 'models'> | undefined {
+  const common = quirks?.[getApiBaseType(targetApiType) as keyof PiAiQuirks];
+  if (!common) return undefined;
+  const { models, ...traits } = common;
+  const model = models?.[modelId];
+  if (!model) return traits;
+  const merged = { ...traits, ...model, compat: { ...traits.compat, ...model.compat } };
+  if ((model.reasoning ?? traits.reasoning) === false) delete merged.thinkingLevelMap;
+  return merged;
+}
+
+/**
+ * Overlay explicit quirks onto a resolved builtin model. The target block is
+ * applied first, then the exact `route.model` entry; each declared field
+ * replaces the layer below it, while omitted fields (notably `reasoning`)
+ * inherit the builtin. An explicit target `api` owns the dialect and may differ
+ * from the builtin model's api.
+ */
+export function applyQuirkOverlay(
+  base: any,
+  quirks: PiAiQuirks | undefined,
+  targetApiType: string,
+  modelId: string
+): any {
+  const target = quirks?.[getApiBaseType(targetApiType) as keyof PiAiQuirks];
+  if (!target) return base;
+  const { models, ...traits } = target;
+  const model = models?.[modelId];
+  const baseCompat = base.compat ?? {};
+  const withTarget = {
+    ...base,
+    ...(traits.api ? { api: traits.api } : {}),
+    ...(traits.reasoning !== undefined ? { reasoning: traits.reasoning } : {}),
+    ...(traits.maxTokens !== undefined ? { maxTokens: traits.maxTokens } : {}),
+    ...(traits.thinkingLevelMap !== undefined ? { thinkingLevelMap: traits.thinkingLevelMap } : {}),
+    ...(traits.serviceTierMap !== undefined ? { serviceTierMap: traits.serviceTierMap } : {}),
+    ...(traits.compat ? { compat: { ...baseCompat, ...traits.compat } } : {}),
+  };
+  // An explicit `reasoning: false` owns the capability: drop any inherited
+  // builtin thinking map even when this target declares no override model.
+  if (withTarget.reasoning === false) delete withTarget.thinkingLevelMap;
+  if (!model) return withTarget;
+  const targetCompat = withTarget.compat ?? baseCompat;
+  const merged = {
+    ...withTarget,
+    ...(model.reasoning !== undefined ? { reasoning: model.reasoning } : {}),
+    ...(model.maxTokens !== undefined ? { maxTokens: model.maxTokens } : {}),
+    ...(model.thinkingLevelMap !== undefined ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
+    ...(model.serviceTierMap !== undefined ? { serviceTierMap: model.serviceTierMap } : {}),
+    ...(model.compat ? { compat: { ...targetCompat, ...model.compat } } : {}),
+  };
+  if (merged.reasoning === false) delete merged.thinkingLevelMap;
+  return merged;
+}
+
+function selectInlineGenerationIntent(
+  traits: Omit<InlineQuirk, 'models'>,
+  intent: GenerationIntent
+): GenerationIntent {
+  const canMapReasoning =
+    traits.reasoning === true &&
+    traits.thinkingLevelMap !== undefined &&
+    (traits.api !== 'openai-completions' ||
+      traits.compat?.thinkingFormat !== undefined ||
+      traits.compat?.supportsReasoningEffort !== undefined);
+  const explicitOff = intent.reasoning.enabled === false;
+  const mapOff = traits.thinkingLevelMap && Object.hasOwn(traits.thinkingLevelMap, 'off');
+  return {
+    reasoning:
+      canMapReasoning && (!explicitOff || mapOff) ? intent.reasoning : { source: 'client' },
+    ...((traits.maxTokens !== undefined || traits.compat?.maxTokensField !== undefined) &&
+    intent.maxTokens !== undefined
+      ? { maxTokens: intent.maxTokens }
+      : {}),
+    ...(traits.compat?.supportsTemperature !== undefined && intent.temperature !== undefined
+      ? { temperature: intent.temperature }
+      : {}),
+    ...(traits.serviceTierMap !== undefined && intent.serviceTier !== undefined
+      ? { serviceTier: intent.serviceTier, serviceTierSource: intent.serviceTierSource }
+      : {}),
+  };
+}
+
+/**
+ * Whether the route positively declares service-tier support for a target: a
+ * per-model `serviceTierMap` (which replaces the provider-wide one) or a
+ * provider-wide map with at least one usable native value. The pi-ai catalog
+ * itself never carries tier maps, so preset/config quirks are the
+ * declaration surface. Unknown support means key defaults are withheld;
+ * explicit client tiers still pass through.
+ */
+function routeDeclaresTierSupport(route: RouteResult, targetApiType: string): boolean {
+  const block = route.config.pi_ai_quirks?.[getApiBaseType(targetApiType) as keyof PiAiQuirks];
+  if (!block) return false;
+  const modelMap = block.models?.[route.model]?.serviceTierMap;
+  const effective = modelMap ?? block.serviceTierMap;
+  if (!effective) return false;
+  return Object.values(effective).some((v) => typeof v === 'string' && v.length > 0);
+}
+
+/** Apply catalog-backed translation on cross-format native Anthropic OAuth routes. */
+export function applyNativeAnthropicCompat(
+  payload: any,
+  request: UnifiedChatRequest,
+  modelId: string
+): any {
+  const model = resolvePiAiModel('anthropic', modelId);
+  if (!model || model.api !== 'anthropic-messages') return payload;
+  const intent = extractGenerationIntent(request.originalBody ?? {}, request);
+  const options = buildGenerationOptions(model, intent);
+  // Messages requires max_tokens. When the client omitted a limit, use the
+  // catalog ceiling rather than the generic builder's conservative fallback.
+  if (request.max_tokens === undefined && intent.maxTokens === undefined && model.maxTokens > 0) {
+    options.maxTokens = model.maxTokens;
+  }
+  return projectAnthropicAutoCompat(payload, model, intent, options);
+}
+
+export function applyRegistryAutoCompat(
+  providerPayload: any,
+  request: UnifiedChatRequest,
+  route: RouteResult,
+  targetApiType: string
+): any {
+  const autoCompat = route.config.auto_compat === true || route.modelConfig?.auto_compat === true;
+
+  // Key defaults are best-effort: when the route declares no tier support,
+  // strip an injected default up front — regardless of auto_compat — so an
+  // unknown provider can never reject the request over a tier nobody asked
+  // for. `auto_compat` defaults off, so gating the strip on it would leave
+  // most unmapped routes sending injected defaults verbatim. Routes with a
+  // declared map keep the injected value for the mapping below; explicit
+  // tiers are never touched here.
+  const tierPayload =
+    !routeDeclaresTierSupport(route, targetApiType) &&
+    SERVICE_TIER_API_TYPES.has(getApiBaseType(targetApiType)) &&
+    typeof providerPayload === 'object' &&
+    providerPayload !== null
+      ? stripKeyDefaultTier(providerPayload, request)
+      : providerPayload;
+
+  if (!autoCompat) return tierPayload;
+
+  const piAiProvider = route.config.pi_ai_provider;
+  const piAiModelId = route.modelConfig?.pi_ai_model_id;
+  const quirks = route.config.pi_ai_quirks;
+
+  // Resolve the builtin base. An explicit per-model link is authoritative: if
+  // it does not resolve, the route stays unresolved (explicit quirks remain the
+  // fallback) rather than silently borrowing a catalog entry for `route.model`.
+  // When the provider is selected but the model is unlinked, resolve the exact
+  // `route.model` in the catalog — the same automatic identity `GET /v1/models`
+  // advertises — before falling back to inline-only quirks.
+  let base: ReturnType<typeof resolvePiAiModel> = null;
+  if (piAiProvider) {
+    base = resolvePiAiModel(piAiProvider, piAiModelId ?? route.model);
+  }
+
+  // Inline quirks are the fallback whenever there is no resolved builtin: no
+  // provider selected, an unresolved explicit link, or an unlinked route whose
+  // model is not in the catalog. Explicit quirks stay authoritative so preset
+  // tier maps work without per-model `pi_ai_model_id` links.
+  const inline =
+    !base && quirks ? resolveInlineQuirks(quirks, targetApiType, route.model) : undefined;
+
+  let piAiModel: any;
+  if (inline) {
+    // A thinking map alone does not opt a model into reasoning for inline
+    // quirks: `reasoning: true` is required (overlays inherit the builtin
+    // instead). Warn rather than let the map silently no-op.
+    if (inline.thinkingLevelMap !== undefined && inline.reasoning !== true) {
+      logger.warn(
+        `Inline quirks for ${route.provider}/${route.model} declare a thinkingLevelMap ` +
+          `without reasoning: true; the map is ignored. Set reasoning: true to enable it.`
+      );
+    }
+    piAiModel = {
+      id: route.model,
+      api: inline.api,
+      // Inline quirks never assume reasoning from a map alone; explicit
+      // `reasoning: true` is required (overlays inherit the builtin instead).
+      reasoning: inline.reasoning === true && inline.thinkingLevelMap !== undefined,
+      thinkingLevelMap: inline.thinkingLevelMap ?? {},
+      serviceTierMap: inline.serviceTierMap,
+      maxTokens: inline.maxTokens,
+      compat: inline.compat ?? {},
+    };
+  } else if (base) {
+    piAiModel = applyQuirkOverlay(base, quirks, targetApiType, route.model);
+  } else {
+    logger.debug(
+      `Registry auto-compat skipped: ${route.provider}/${route.model} has no resolvable ` +
+        `pi-ai base${
+          piAiProvider ? ` (${piAiProvider}/${piAiModelId ?? '<unlinked>'})` : ''
+        } and no matching quirks`
+    );
+    return tierPayload;
+  }
+
+  const intent = extractGenerationIntent(tierPayload, request);
+  const selectedIntent = inline ? selectInlineGenerationIntent(inline, intent) : intent;
+  const options = buildGenerationOptions(piAiModel, selectedIntent);
+  // An inline API declaration alone carries no model capabilities. Leave the
+  // payload untouched unless a declared trait actually requests a projection.
+  if (inline && Object.keys(options).length === 0 && inline.compat?.supportsTemperature !== false) {
+    return tierPayload;
+  }
+
+  // Anthropic fast mode's beta flag is resolved at fetch time in
+  // standard-attempt-request.ts against the FINAL `speed`, so an explicit
+  // override to `standard` (or a strip-and-retry that removes `speed`) never
+  // leaves a stale fast-mode beta behind.
+
+  const api = (piAiModel.api as string | undefined) ?? targetApiType;
+  let nextPayload: any;
+  if (
+    api === 'openai-responses' ||
+    api === 'openai-codex-responses' ||
+    api === 'azure-openai-responses'
+  ) {
+    nextPayload = projectResponsesAutoCompat(tierPayload, piAiModel, selectedIntent, options);
+  } else if (api === 'anthropic-messages') {
+    nextPayload = projectAnthropicAutoCompat(
+      tierPayload,
+      piAiModel,
+      selectedIntent,
+      options,
+      !!inline
+    );
+  } else if (api === 'google-generative-ai' || api === 'google-generative-ai-vertex') {
+    nextPayload = projectGeminiAutoCompat(tierPayload, selectedIntent, options);
+  } else {
+    nextPayload = projectOpenAiCompletionsAutoCompat(
+      tierPayload,
+      request,
+      piAiModel,
+      selectedIntent,
+      options
+    );
+  }
+
+  logger.debug(`Registry auto-compat applied for ${route.provider}/${route.model}`, {
+    ...(inline ? { inline: true } : { piAiProvider, piAiModelId }),
+    api,
+    optionKeys: Object.keys(options),
+  });
+
+  return nextPayload;
+}
+
+// ---------------------------------------------------------------------------
+// Reactive auto-compat: strip-and-retry on named unsupported params
+// ---------------------------------------------------------------------------
+//
+// Some upstreams 400 naming one *specific* parameter rather than rejecting the
+// whole request (e.g. OpenAI-compatible Responses API providers reject a
+// client-sent `safety_identifier` or `prompt_cache_key` with
+// `{"detail":"Unsupported parameter: safety_identifier"}` or
+// `{"error":{"message":"Unknown parameter: 'foo'"}}`). Failing over to the
+// next configured target doesn't help when the *client* sent the offending
+// field — every target would reject it the same way. Instead, the dispatch
+// loop (see standard-attempt-request.ts) strips the named field from the
+// outbound payload and retries the SAME target.
+
+/**
+ * Matches `{"detail":"Unsupported parameter: X"}`, `{"error":{"message":
+ * "Unknown parameter: 'X'"}}`, and backtick-quoted shapes (e.g. the Meta
+ * Model API's `unknown parameter \`reasoning\``). The captured group also
+ * matches dotted paths (e.g. `reasoning.summary`) and bracket-notation paths
+ * (e.g. `messages[0].name`), since providers name nested fields both ways. A
+ * capture that stopped at `[` would truncate `messages[0].name` to `messages`
+ * — and the paired delete would then remove the ENTIRE conversation from the
+ * retry payload.
+ */
+const UNSUPPORTED_PARAMETER_PATTERN =
+  /(?:unsupported|unknown) parameter[:\s]+['"`]?([\w.[\]]+)['"`]?/i;
+
+/**
+ * Canonicalizes bracket-notation segments to dotted form
+ * (`messages[0].name` → `messages.0.name`) so `deleteDottedPath` — which
+ * only understands dot-separated segments — receives the path in the form
+ * its array handling expects, and so the same field can't dodge
+ * already-stripped dedup by being spelled two ways across retries.
+ */
+function normalizeBracketSegments(path: string): string {
+  return path.replace(/\[(\w+)\]/g, '.$1');
+}
+
+/**
+ * Extracts the offending parameter name from an upstream error response body
+ * (normalized to canonical dotted form — see `normalizeBracketSegments`), or
+ * `undefined` when the body doesn't name an unsupported parameter.
+ */
+export function matchUnsupportedParameter(responseBody: string): string | undefined {
+  if (!responseBody) return undefined;
+  const paramName = UNSUPPORTED_PARAMETER_PATTERN.exec(responseBody)?.[1];
+  return paramName === undefined ? undefined : normalizeBracketSegments(paramName);
+}
+
+/** Segment names that must never be traversed — see `deleteDottedPath`. */
+const DANGEROUS_PATH_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/** Canonical decimal index: "0", "7", "12" — never "01", "length", "-1". */
+const CANONICAL_ARRAY_INDEX_PATTERN = /^(0|[1-9]\d*)$/;
+
+/**
+ * True when `segment` addresses an in-bounds element of `array` in canonical
+ * decimal form. Arrays participate in `deleteDottedPath` ONLY through such
+ * segments: `hasOwnProperty` alone would also admit `length` (an OWN
+ * property of every array) and expando keys, and rebuilding around those
+ * would corrupt the array into an object. Anything non-canonical is refused
+ * (deleted:false) rather than guessed at.
+ */
+function isCanonicalArrayIndex(segment: string, array: readonly unknown[]): boolean {
+  return CANONICAL_ARRAY_INDEX_PATTERN.test(segment) && Number(segment) < array.length;
+}
+
+export interface DeleteDottedPathResult {
+  /**
+   * The payload with the field removed. A NEW object (copy-on-write) when
+   * `deleted` is true: every object on the affected path, from the root down
+   * to the leaf's immediate parent, is shallow-cloned before the leaf is
+   * deleted, so nothing shared with another reference is ever mutated.
+   * Identical to the input `payload` reference when `deleted` is false
+   * (rejected path or no-op — nothing to rebuild).
+   */
+  payload: Record<string, any>;
+  /**
+   * Whether a field was actually removed. `false` for a rejected dangerous
+   * segment, an absent field, or a non-object intermediate segment — callers
+   * MUST treat `false` as "nothing changed" and skip any retry that assumes
+   * the payload is now different.
+   */
+  deleted: boolean;
+}
+
+/**
+ * Deletes a (possibly dotted, e.g. "reasoning.summary") field path from a
+ * payload object. Returns the (possibly new) payload plus whether a field
+ * was actually removed.
+ *
+ * SECURITY: `path` is attacker-influenced — it is parsed out of an upstream
+ * provider's error message (see `matchUnsupportedParameter`, whose
+ * `[\w.[\]]+` capture matches dots, underscores, AND bracket segments,
+ * normalized to dotted form), and the upstream is not a trusted party. Two
+ * independent defenses prevent prototype pollution:
+ *   1. Any segment named `__proto__`, `constructor`, or `prototype` is
+ *      rejected outright, before any traversal. Without this, a path like
+ *      `__proto__.toString` would resolve `payload.__proto__` via the
+ *      INHERITED accessor to the real `Object.prototype` (typical payload
+ *      objects have no OWN property by that name), and the previous
+ *      in-place `delete target[leaf]` would then delete the global
+ *      `Object.prototype.toString` for the entire process, permanently,
+ *      across every subsequent request.
+ *   2. Traversal only ever follows OWN enumerable properties
+ *      (`hasOwnProperty`), never inherited ones (the previous `segment in
+ *      target` check matched inherited properties too), so even a segment
+ *      not on the deny-list can't walk onto something inherited from the
+ *      prototype chain.
+ *
+ * COPY-ON-WRITE: the input `payload`, and every nested container on the
+ * traversed path, is never mutated in place. `providerPayload` can share a
+ * nested object BY REFERENCE with the long-lived `UnifiedChatRequest` (e.g.
+ * `payload.reasoning = request.reasoning` in transformers/responses.ts) —
+ * mutating that object in place would corrupt it for every OTHER failover
+ * target built from the same request afterward. Instead, every container
+ * from the root down to the leaf's immediate parent is shallow-cloned and a
+ * NEW payload is returned; untouched sibling branches are shared, not
+ * cloned.
+ *
+ * ARRAYS: numeric segments CAN traverse arrays (an upstream 400 naming e.g.
+ * `messages.0.some_field` is capturable by `matchUnsupportedParameter`), and
+ * every array on the path is rebuilt AS an array — never spread into an
+ * object-shaped `{"0": ...}` payload. Arrays only participate via canonical
+ * in-bounds indices (see `isCanonicalArrayIndex`; `length`/expando segments
+ * are refused untouched). When the LEAF itself is an array index, the
+ * element is removed splice-style — later elements shift left — because
+ * `delete arr[i]` would leave a hole that serializes as `null`, which is
+ * just as malformed as the object-shaped payload.
+ */
+export function deleteDottedPath(
+  payload: Record<string, any>,
+  path: string
+): DeleteDottedPathResult {
+  const segments = path.split('.');
+
+  if (segments.some((segment) => DANGEROUS_PATH_SEGMENTS.has(segment))) {
+    return { payload, deleted: false };
+  }
+
+  // Walk the path, recording the (container, key) pair at each level so the
+  // chain can be rebuilt with clones afterward. Bail out — no traversal
+  // beyond this point, no mutation, no clone — the instant a segment isn't
+  // an own enumerable property (or, for arrays, a canonical in-bounds
+  // index): an absent field or non-object intermediate means there's
+  // nothing to strip.
+  const chain: Array<{ obj: Record<string, any>; key: string }> = [];
+  let target: any = payload;
+  for (let i = 0; i < segments.length - 1; i++) {
+    const segment = segments[i]!;
+    if (
+      target == null ||
+      typeof target !== 'object' ||
+      !Object.prototype.hasOwnProperty.call(target, segment) ||
+      (Array.isArray(target) && !isCanonicalArrayIndex(segment, target))
+    ) {
+      return { payload, deleted: false };
+    }
+    chain.push({ obj: target, key: segment });
+    target = target[segment];
+  }
+
+  const leaf = segments[segments.length - 1]!;
+  if (
+    target == null ||
+    typeof target !== 'object' ||
+    !Object.prototype.hasOwnProperty.call(target, leaf) ||
+    (Array.isArray(target) && !isCanonicalArrayIndex(leaf, target))
+  ) {
+    return { payload, deleted: false };
+  }
+
+  // Rebuild the chain bottom-up with shallow clones so nothing shared with
+  // another reference is mutated, preserving each level's container kind.
+  let rebuilt: any;
+  if (Array.isArray(target)) {
+    // Array-index leaf: splice-style removal (no hole — see doc comment).
+    const index = Number(leaf);
+    rebuilt = [...target.slice(0, index), ...target.slice(index + 1)];
+  } else {
+    rebuilt = { ...target };
+    delete rebuilt[leaf];
+  }
+  for (let i = chain.length - 1; i >= 0; i--) {
+    const { obj, key } = chain[i]!;
+    if (Array.isArray(obj)) {
+      const clone = [...obj];
+      clone[Number(key)] = rebuilt;
+      rebuilt = clone;
+    } else {
+      rebuilt = { ...obj, [key]: rebuilt };
+    }
+  }
+
+  return { payload: rebuilt, deleted: true };
+}
+
+/** Per-target, per-request bound: at most this many strip-and-retry cycles. */
+export const MAX_UNSUPPORTED_PARAM_STRIP_RETRIES = 2;
+
+/**
+ * Top-level fields the strip-and-retry mechanism must never delete
+ * WHOLESALE: removing the entire conversation (`messages` / `input`) or the
+ * `model` guarantees a malformed request that every upstream rejects, so an
+ * upstream 400 naming one of these EXACTLY (full normalized path, no
+ * sub-path) gets normal failover instead of a doomed strip-retry. Sub-paths
+ * within them (e.g. `messages.0.name`) and other whole fields (`tools`,
+ * `safety_identifier`, ...) remain strippable.
+ */
+const UNSTRIPPABLE_STRUCTURAL_FIELDS = new Set(['messages', 'input', 'model']);
+
+/**
+ * Structural roots whose DIRECT numeric elements are entire conversation
+ * items. `Unsupported parameter: messages[0]` normalizes to `messages.0`,
+ * which dodges the exact-name guard above — but the paired deleteDottedPath
+ * would splice a whole message/input item out of the conversation, mutilating
+ * the request as surely as deleting the whole field. `model` is a string, so
+ * it has no element paths to guard.
+ */
+const STRUCTURAL_ARRAY_ROOTS = new Set(['messages', 'input']);
+
+/**
+ * True when the normalized path is exactly `<structural root>.<number>` — a
+ * numeric leaf DIRECTLY under a structural array (`messages.0`, `input.12`).
+ * Deeper paths (`messages.0.name`) address a field WITHIN the item and stay
+ * strippable; numeric leaves under non-structural arrays (`tools.2`) stay
+ * splice-deletable.
+ */
+function isStructuralArrayElementPath(path: string): boolean {
+  const segments = path.split('.');
+  return (
+    segments.length === 2 && STRUCTURAL_ARRAY_ROOTS.has(segments[0]!) && /^\d+$/.test(segments[1]!)
+  );
+}
+
+/** Tracks strip-and-retry progress for a single target within one request. */
+export interface UnsupportedParamStripState {
+  attempts: number;
+  strippedParams: Set<string>;
+}
+
+export function createUnsupportedParamStripState(): UnsupportedParamStripState {
+  return { attempts: 0, strippedParams: new Set() };
+}
+
+/**
+ * Decides whether an upstream 400 body naming an unsupported parameter should
+ * trigger another strip-and-retry cycle against the same target, recording
+ * the attempt in `state` when it does.
+ *
+ * Returns the parameter name to strip (in canonical dotted form), or
+ * `undefined` when the retry should NOT happen because:
+ *   - the body doesn't name an unsupported parameter, OR
+ *   - the named parameter is a protected structural field
+ *     (UNSTRIPPABLE_STRUCTURAL_FIELDS) whose wholesale deletion guarantees a
+ *     malformed request — refused before any budget is consumed, OR
+ *   - the named parameter is a numeric element directly under a structural
+ *     array (`messages.0` / `input[2]` — see isStructuralArrayElementPath):
+ *     splice-deleting an entire conversation item is as destructive as
+ *     deleting the whole field, so it gets the same budget-free refusal, OR
+ *   - the MAX_UNSUPPORTED_PARAM_STRIP_RETRIES bound has been reached, OR
+ *   - the named parameter was already stripped on an earlier attempt for this
+ *     target — an upstream that keeps rejecting the same field after it's
+ *     been removed can't be fixed by retrying, so stop immediately rather
+ *     than burning through the retry bound on a no-op loop.
+ */
+export function planUnsupportedParamStrip(
+  responseBody: string,
+  state: UnsupportedParamStripState
+): string | undefined {
+  if (state.attempts >= MAX_UNSUPPORTED_PARAM_STRIP_RETRIES) return undefined;
+
+  const paramName = matchUnsupportedParameter(responseBody);
+  if (!paramName || UNSTRIPPABLE_STRUCTURAL_FIELDS.has(paramName)) return undefined;
+  if (isStructuralArrayElementPath(paramName)) return undefined;
+  if (state.strippedParams.has(paramName)) return undefined;
+
+  state.attempts++;
+  state.strippedParams.add(paramName);
+  return paramName;
+}
+
+// ---------------------------------------------------------------------------
+// Reactive auto-compat: strip-and-retry on stale Anthropic thinking-block
+// signatures
+// ---------------------------------------------------------------------------
+//
+// Alias-level failover can replay a conversation containing `thinking` /
+// `redacted_thinking` blocks signed by one Claude model against a DIFFERENT
+// Claude model (e.g. cc/claude-opus-5 -> cc/claude-opus-4-8 -> cc/claude-opus-4-7).
+// Anthropic rejects a thinking-block signature produced by another
+// model/session with a 400 naming the signature specifically, e.g.:
+//   {"type":"error","error":{"type":"invalid_request_error",
+//    "message":"messages.3.content.0: Invalid `signature` in `thinking` block"}}
+// Failing over to the next target doesn't help — every remaining Claude
+// target rejects the same stale signature the same way. Instead strip the
+// thinking/redacted_thinking blocks from the outbound Anthropic Messages
+// payload and retry the SAME target once.
+
+/**
+ * Matches Anthropic's stale/invalid thinking-block-signature 400, e.g.
+ * `messages.3.content.0: Invalid \`signature\` in \`thinking\` block`.
+ * Backtick-quoting of "signature"/"thinking" is optional since not every
+ * upstream quotes them identically.
+ */
+const THINKING_SIGNATURE_ERROR_PATTERN = /invalid\s+`?signature`?\s+in\s+`?thinking`?\s+block/i;
+
+/**
+ * True when an upstream error response body names an invalid/stale
+ * thinking-block signature.
+ */
+export function matchThinkingSignatureError(responseBody: string): boolean {
+  if (!responseBody) return false;
+  return THINKING_SIGNATURE_ERROR_PATTERN.test(responseBody);
+}
+
+/**
+ * True when the outbound payload is Anthropic-Messages-API-shaped (has a
+ * `messages` array) — the only shape that can carry `thinking` /
+ * `redacted_thinking` blocks in the first place. Note this is a structural
+ * check only: an OpenAI chat-completions payload also has a `messages`
+ * array, so this alone doesn't prove the target is Anthropic. In practice
+ * that's harmless here — the paired body match
+ * (`matchThinkingSignatureError`) only fires on Anthropic's specific
+ * signature-rejection wording, which a non-Anthropic upstream won't emit.
+ */
+export function isAnthropicMessagesPayload(payload: any): boolean {
+  return !!payload && typeof payload === 'object' && Array.isArray(payload.messages);
+}
+
+function isThinkingBlock(block: any): boolean {
+  return (
+    !!block &&
+    typeof block === 'object' &&
+    (block.type === 'thinking' || block.type === 'redacted_thinking')
+  );
+}
+
+function contentHasBlockType(content: any, type: string): boolean {
+  return (
+    Array.isArray(content) &&
+    content.some((block: any) => block && typeof block === 'object' && block.type === type)
+  );
+}
+
+// A fresh array/object is allocated per call (not a shared module-level
+// constant) so multiple placeholder messages in the same payload never end
+// up aliasing the same mutable content array.
+function reasoningElidedPlaceholder(): Array<{ type: 'text'; text: string }> {
+  return [{ type: 'text', text: '[reasoning elided]' }];
+}
+
+export interface ThinkingSignatureStripResult {
+  /**
+   * The payload with every `thinking` / `redacted_thinking` block removed.
+   * A NEW object (copy-on-write) when `strippedCount` > 0: the root is
+   * shallow-cloned with a NEW `messages` array, and each message whose
+   * content changed is shallow-cloned — the input payload, its `messages`
+   * array, and every original message object are never mutated (the payload
+   * can share `messages`/message objects by reference with the long-lived
+   * `UnifiedChatRequest`; see `deleteDottedPath`'s copy-on-write rationale).
+   * Untouched messages are shared, not cloned. Identical to the input
+   * `payload` reference when `strippedCount` is 0 — nothing to rebuild.
+   */
+  payload: Record<string, any>;
+  /**
+   * Number of thinking/redacted_thinking blocks actually removed (0 when
+   * the payload isn't Anthropic-messages-shaped, or had none to strip).
+   * Callers MUST treat 0 as "nothing changed" and skip any retry that
+   * assumes the payload is now different — the structural
+   * `isAnthropicMessagesPayload` gate also matches OpenAI chat-completions
+   * payloads (they have a `messages` array too), which never carry thinking
+   * blocks, so a 0-strip retry would resend a byte-identical request.
+   */
+  strippedCount: number;
+}
+
+/**
+ * Removes every `thinking` / `redacted_thinking` block from every message's
+ * `content` array, copy-on-write (see `ThinkingSignatureStripResult` — the
+ * input payload is never mutated). When a message's `content` becomes empty
+ * as a result of the strip, the message is dropped entirely UNLESS doing so
+ * would:
+ *   - break strict user/assistant role alternation — the nearest retained
+ *     message before it and the message right after it would end up with
+ *     the same role, or
+ *   - orphan a `tool_result` — the next message carries a `tool_result` but
+ *     the nearest retained message before the drop does NOT carry the
+ *     matching `tool_use`, so removing the bridge would leave that
+ *     `tool_result` without its paired call.
+ * In either case the emptied content is replaced with a
+ * `[{"type":"text","text":"[reasoning elided]"}]` placeholder instead of
+ * dropping the message, so the conversation shape stays valid.
+ *
+ * Non-array `content` (e.g. plain-string messages) is left untouched.
+ */
+export function stripThinkingSignatureBlocks(
+  payload: Record<string, any>
+): ThinkingSignatureStripResult {
+  if (!isAnthropicMessagesPayload(payload)) return { payload, strippedCount: 0 };
+
+  let strippedCount = 0;
+  const perMessage: Array<{
+    message: any;
+    content: any;
+    isArrayContent: boolean;
+    changed: boolean;
+  }> = payload.messages.map((message: any) => {
+    if (!message || !Array.isArray(message.content)) {
+      return { message, content: message?.content, isArrayContent: false, changed: false };
+    }
+    const kept = message.content.filter((block: any) => {
+      if (isThinkingBlock(block)) {
+        strippedCount++;
+        return false;
+      }
+      return true;
+    });
+    return {
+      message,
+      content: kept,
+      isArrayContent: true,
+      changed: kept.length !== message.content.length,
+    };
+  });
+
+  if (strippedCount === 0) return { payload, strippedCount: 0 };
+
+  const result: any[] = [];
+  for (let i = 0; i < perMessage.length; i++) {
+    const { message, content, isArrayContent, changed } = perMessage[i]!;
+
+    if (!isArrayContent || content.length > 0) {
+      // Only messages that actually lost a block are cloned; untouched
+      // messages are shared by reference (copy-on-write).
+      result.push(changed ? { ...message, content } : message);
+      continue;
+    }
+
+    // Content became empty after stripping — decide drop vs. placeholder.
+    const prevMessage = result[result.length - 1];
+    const nextMessage = perMessage[i + 1]?.message;
+
+    const wouldBreakAlternation =
+      !!prevMessage && !!nextMessage && prevMessage.role === nextMessage.role;
+    const nextHasToolResult = contentHasBlockType(nextMessage?.content, 'tool_result');
+    const prevHasToolUse = contentHasBlockType(prevMessage?.content, 'tool_use');
+    const wouldOrphanToolResult = nextHasToolResult && !prevHasToolUse;
+
+    if (wouldBreakAlternation || wouldOrphanToolResult) {
+      result.push({ ...message, content: reasoningElidedPlaceholder() });
+    }
+    // else: drop — push nothing for this message.
+  }
+
+  return { payload: { ...payload, messages: result }, strippedCount };
+}
+
+/** Per-target, per-request bound: at most one signature-strip-and-retry cycle. */
+export const MAX_THINKING_SIGNATURE_STRIP_RETRIES = 1;
+
+/** Tracks signature-strip-and-retry progress for a single target within one request. */
+export interface ThinkingSignatureStripState {
+  attempts: number;
+}
+
+export function createThinkingSignatureStripState(): ThinkingSignatureStripState {
+  return { attempts: 0 };
+}
+
+/**
+ * Decides whether an upstream 400 body naming an invalid thinking-block
+ * signature should trigger a strip-and-retry cycle against the same target,
+ * recording the attempt in `state` when it does. Returns `false` when the
+ * retry should NOT happen because:
+ *   - the body doesn't name a thinking-signature error, OR
+ *   - the outbound payload isn't Anthropic-messages-shaped (no `messages`
+ *     array to strip thinking blocks from), OR
+ *   - MAX_THINKING_SIGNATURE_STRIP_RETRIES has already been used for this
+ *     target (bounded to exactly one retry — unlike the unsupported-param
+ *     strip, there's no "new param" escape hatch here: once the thinking
+ *     blocks are gone, a repeat 400 means stripping them didn't fix it, so
+ *     normal failover should proceed rather than retrying again).
+ */
+export function planThinkingSignatureStrip(
+  responseBody: string,
+  payload: any,
+  state: ThinkingSignatureStripState
+): boolean {
+  if (state.attempts >= MAX_THINKING_SIGNATURE_STRIP_RETRIES) return false;
+  if (!matchThinkingSignatureError(responseBody)) return false;
+  if (!isAnthropicMessagesPayload(payload)) return false;
+
+  state.attempts++;
+  return true;
+}
+
+/**
+ * Refunds the attempt recorded by the most recent `planThinkingSignatureStrip`
+ * when the paired `stripThinkingSignatureBlocks` turned out to be a no-op
+ * (`strippedCount` 0 — the structural `messages`-array check matched an
+ * OpenAI-format payload that carries no thinking blocks). No retry happened,
+ * so the budget must not be consumed: a LATER genuine signature 400 on the
+ * same target must still get its one strip-and-retry.
+ *
+ * Loop safety: the refund is issued only on the signature branch's no-strip
+ * path, which itself never `continue`s — so a refund can never re-arm the
+ * signature retry it was issued for. The refunding ITERATION may still
+ * `continue` via the unsupported-param handling in the latter half of the
+ * same `response.status === 400` guard, but that retry consumes an attempt
+ * from the param-strip budget, so the combined fetch bound in
+ * standard-attempt-request.ts holds: every extra fetch consumes an
+ * un-refunded attempt from one of the two strip budgets.
+ */
+export function refundThinkingSignatureStrip(state: ThinkingSignatureStripState): void {
+  if (state.attempts > 0) state.attempts--;
+}
+
+// ---------------------------------------------------------------------------
+// Reactive auto-compat: strip-and-retry on account-bound Anthropic advisor
+// server-tool result content
+// ---------------------------------------------------------------------------
+//
+// The `advisor` server-side tool (beta `advisor-tool-2026-03-01`) returns its
+// result as an account/session-bound ENCRYPTED blob echoed back on every later
+// turn, paired with the assistant's `server_tool_use` invocation:
+//   { "type": "server_tool_use", "id": "srvtoolu_…", "name": "advisor", … }
+//   { "type": "advisor_tool_result", "tool_use_id": "srvtoolu_…",
+//     "content": { "type": "advisor_redacted_result", "encrypted_content": "…" } }
+// This is the same signed-blob mechanism as `redacted_thinking`: sealed under
+// the specific Claude account that produced it. When alias-level failover
+// replays that conversation against a DIFFERENT account (e.g. the sticky
+// account 529s and dispatch falls over to a sibling in the same pool),
+// Anthropic can't decrypt a blob sealed by another account and 400s:
+//   {"type":"error","error":{"type":"invalid_request_error",
+//    "message":"Advisor tool result content could not be processed."}}
+// Every remaining account in the pool rejects it the same way, so failing over
+// doesn't help. Strip the advisor exchange (the sealed result plus its paired
+// `server_tool_use` invocation, so the invocation isn't left unresolved) and
+// retry the SAME target once.
+
+/**
+ * Matches Anthropic's advisor sealed-result-rejection 400, e.g.
+ * `Advisor tool result content could not be processed.`. The wording names
+ * the advisor result generically (not a specific message index), so a plain
+ * substring/case-insensitive match is sufficient and won't misfire on
+ * unrelated 400s.
+ */
+const ADVISOR_RESULT_ERROR_PATTERN = /advisor tool result content could not be processed/i;
+
+/**
+ * True when an upstream error response body names an advisor result that
+ * could not be processed (an account-bound blob replayed against the wrong
+ * account).
+ */
+export function matchAdvisorResultError(responseBody: string): boolean {
+  if (!responseBody) return false;
+  return ADVISOR_RESULT_ERROR_PATTERN.test(responseBody);
+}
+
+function isAdvisorResultBlock(block: any): boolean {
+  return !!block && typeof block === 'object' && block.type === 'advisor_tool_result';
+}
+
+function isAdvisorInvocationBlock(block: any, sealedIds: Set<string>): boolean {
+  return (
+    !!block &&
+    typeof block === 'object' &&
+    (block.type === 'server_tool_use' || block.type === 'advisor_tool_use') &&
+    typeof block.id === 'string' &&
+    sealedIds.has(block.id)
+  );
+}
+
+// A fresh array/object per call (see reasoningElidedPlaceholder) so multiple
+// emptied advisor messages in one payload never alias the same mutable array.
+function advisorElidedPlaceholder(): Array<{ type: 'text'; text: string }> {
+  return [{ type: 'text', text: '[advisor result elided]' }];
+}
+
+export interface AdvisorResultStripResult {
+  /**
+   * The payload with every `advisor_tool_result` block — and the paired
+   * `server_tool_use`/`advisor_tool_use` invocation that produced it, matched
+   * by `tool_use_id` → `id` — removed. Copy-on-write when `strippedCount` > 0
+   * (identical semantics to `ThinkingSignatureStripResult`): the root and its
+   * `messages` array are shallow-cloned, each changed message is shallow-cloned,
+   * and untouched messages are shared by reference; the input payload is never
+   * mutated. Identical to the input `payload` reference when `strippedCount`
+   * is 0.
+   */
+  payload: Record<string, any>;
+  /**
+   * Number of `advisor_tool_result` blocks actually removed (0 when the
+   * payload isn't Anthropic-messages-shaped or carried no advisor result).
+   * Callers MUST treat 0 as "nothing changed" and skip the retry — the
+   * structural `isAnthropicMessagesPayload` gate also matches OpenAI
+   * chat-completions payloads, which never carry advisor blocks, so a 0-strip
+   * retry would resend a byte-identical request.
+   */
+  strippedCount: number;
+}
+
+/**
+ * Removes every `advisor_tool_result` block, plus its paired
+ * `server_tool_use`/`advisor_tool_use` invocation (matched by
+ * `tool_use_id` → `id`, across all messages so placement in the same or a
+ * separate message both work), copy-on-write. Emptied-content handling mirrors
+ * `stripThinkingSignatureBlocks`: when a message's `content` becomes empty the
+ * message is dropped UNLESS doing so would break user/assistant alternation or
+ * orphan a following `tool_result`, in which case an `[advisor result elided]`
+ * text placeholder is substituted so the conversation shape stays valid.
+ */
+export function stripAdvisorResultBlocks(payload: Record<string, any>): AdvisorResultStripResult {
+  if (!isAnthropicMessagesPayload(payload)) return { payload, strippedCount: 0 };
+
+  // Pass 1: collect the ids of every sealed advisor result so we can also
+  // drop the paired invocation and never leave a `server_tool_use` unresolved.
+  const sealedIds = new Set<string>();
+  for (const message of payload.messages) {
+    if (!message || !Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (isAdvisorResultBlock(block) && typeof block.tool_use_id === 'string') {
+        sealedIds.add(block.tool_use_id);
+      }
+    }
+  }
+
+  let strippedCount = 0;
+  const perMessage: Array<{
+    message: any;
+    content: any;
+    isArrayContent: boolean;
+    changed: boolean;
+  }> = payload.messages.map((message: any) => {
+    if (!message || !Array.isArray(message.content)) {
+      return { message, content: message?.content, isArrayContent: false, changed: false };
+    }
+    const kept = message.content.filter((block: any) => {
+      if (isAdvisorResultBlock(block)) {
+        strippedCount++;
+        return false;
+      }
+      if (isAdvisorInvocationBlock(block, sealedIds)) {
+        return false;
+      }
+      return true;
+    });
+    return {
+      message,
+      content: kept,
+      isArrayContent: true,
+      changed: kept.length !== message.content.length,
+    };
+  });
+
+  if (strippedCount === 0) return { payload, strippedCount: 0 };
+
+  const result: any[] = [];
+  for (let i = 0; i < perMessage.length; i++) {
+    const { message, content, isArrayContent, changed } = perMessage[i]!;
+
+    if (!isArrayContent || content.length > 0) {
+      result.push(changed ? { ...message, content } : message);
+      continue;
+    }
+
+    // Content became empty after stripping — decide drop vs. placeholder,
+    // identically to stripThinkingSignatureBlocks.
+    const prevMessage = result[result.length - 1];
+    const nextMessage = perMessage[i + 1]?.message;
+
+    const wouldBreakAlternation =
+      !!prevMessage && !!nextMessage && prevMessage.role === nextMessage.role;
+    const nextHasToolResult = contentHasBlockType(nextMessage?.content, 'tool_result');
+    const prevHasToolUse = contentHasBlockType(prevMessage?.content, 'tool_use');
+    const wouldOrphanToolResult = nextHasToolResult && !prevHasToolUse;
+
+    if (wouldBreakAlternation || wouldOrphanToolResult) {
+      result.push({ ...message, content: advisorElidedPlaceholder() });
+    }
+    // else: drop — push nothing for this message.
+  }
+
+  return { payload: { ...payload, messages: result }, strippedCount };
+}
+
+/** Per-target, per-request bound: at most one advisor-result-strip-and-retry cycle. */
+export const MAX_ADVISOR_RESULT_STRIP_RETRIES = 1;
+
+/** Tracks advisor-result-strip-and-retry progress for a single target within one request. */
+export interface AdvisorResultStripState {
+  attempts: number;
+}
+
+export function createAdvisorResultStripState(): AdvisorResultStripState {
+  return { attempts: 0 };
+}
+
+/**
+ * Decides whether an upstream 400 naming an unprocessable advisor result
+ * should trigger a strip-and-retry cycle against the same target, recording
+ * the attempt in `state` when it does. Returns `false` when the retry should
+ * NOT happen because:
+ *   - the body doesn't name the advisor-result error, OR
+ *   - the outbound payload isn't Anthropic-messages-shaped, OR
+ *   - MAX_ADVISOR_RESULT_STRIP_RETRIES has already been used for this target
+ *     (bounded to exactly one retry — once the advisor exchange is gone, a
+ *     repeat 400 means stripping it didn't fix it, so normal failover should
+ *     proceed rather than retrying again).
+ */
+export function planAdvisorResultStrip(
+  responseBody: string,
+  payload: any,
+  state: AdvisorResultStripState
+): boolean {
+  if (state.attempts >= MAX_ADVISOR_RESULT_STRIP_RETRIES) return false;
+  if (!matchAdvisorResultError(responseBody)) return false;
+  if (!isAnthropicMessagesPayload(payload)) return false;
+
+  state.attempts++;
+  return true;
+}
+
+/**
+ * Refunds the attempt recorded by the most recent `planAdvisorResultStrip`
+ * when the paired `stripAdvisorResultBlocks` turned out to be a no-op
+ * (`strippedCount` 0 — the structural `messages`-array check matched a payload
+ * that carries no advisor result). No retry happened, so the budget must not
+ * be consumed: a LATER genuine advisor-result 400 on the same target must
+ * still get its one strip-and-retry. Loop safety matches
+ * `refundThinkingSignatureStrip` — the refund is issued only on the advisor
+ * branch's no-strip path, which never `continue`s.
+ */
+export function refundAdvisorResultStrip(state: AdvisorResultStripState): void {
+  if (state.attempts > 0) state.attempts--;
+}
+
+// ---------------------------------------------------------------------------
+// Unsupported responses:lite tools: proactive strip + reactive strip-and-retry
+// ---------------------------------------------------------------------------
+//
+// Real Codex CLI traffic declares a `web_search` tool by default (see staging
+// trace b672ebbd), but the `X-OpenAI-Internal-Codex-Responses-Lite` wire
+// contract (sent whenever targetApiType is exactly `responses:lite` — see
+// provider-request-headers.ts) restricts declared tools to `function`,
+// `custom`, and client-executed `tool_search` only. Both providers currently
+// configured for the subtype (openlimits, openai-s) reject anything else with
+// a 400 naming the restriction generically, not the specific offending
+// tool(s).
+//
+// `stripLiteUnsupportedTools` is used two ways:
+//   - PROACTIVELY, in request-payload-builder.ts, applied unconditionally
+//     whenever dispatching with the lite header so the common case (Codex's
+//     default `web_search` declaration) never pays a failed round trip.
+//   - REACTIVELY here, as a fallback for anything the proactive pass didn't
+//     anticipate (e.g. a disallowed tool type not yet known about) — failing
+//     over doesn't help, since every lite-configured target enforces the
+//     same restriction, so strip and retry the SAME target once instead.
+
+/**
+ * Matches the responses:lite tool-type-restriction 400, e.g.
+ * "X-OpenAI-Internal-Codex-Responses-Lite only supports function tools,
+ * custom tools, and client-executed tool search."
+ */
+const LITE_UNSUPPORTED_TOOLS_PATTERN =
+  /responses-lite only supports function tools, custom tools, and client-executed tool search/i;
+
+/**
+ * True when an upstream error response body names the responses:lite
+ * tool-type restriction.
+ */
+export function matchLiteUnsupportedToolsError(responseBody: string): boolean {
+  if (!responseBody) return false;
+  return LITE_UNSUPPORTED_TOOLS_PATTERN.test(responseBody);
+}
+
+export interface LiteToolStripResult {
+  /**
+   * The payload with every disallowed tool removed. A NEW object
+   * (copy-on-write) with a NEW `tools` array when `strippedCount` > 0 — the
+   * input payload's `tools` array (possibly shared by reference with the
+   * long-lived UnifiedChatRequest) is never mutated. Identical to the input
+   * `payload` reference when `strippedCount` is 0 — nothing to rebuild.
+   */
+  payload: Record<string, any>;
+  /** Number of tools actually removed (0 when there was nothing to strip). */
+  strippedCount: number;
+}
+
+/**
+ * Removes any `payload.tools` entry whose `type` isn't `function`, `custom`,
+ * or `tool_search` (see `LITE_ALLOWED_TOOL_TYPES`) — copy-on-write, like the
+ * strips above.
+ */
+export function stripLiteUnsupportedTools(payload: Record<string, any>): LiteToolStripResult {
+  if (!Array.isArray(payload.tools)) return { payload, strippedCount: 0 };
+
+  const kept = payload.tools.filter(
+    (tool: any) => tool && typeof tool === 'object' && LITE_ALLOWED_TOOL_TYPES.has(tool.type)
+  );
+  const strippedCount = payload.tools.length - kept.length;
+  if (strippedCount === 0) return { payload, strippedCount: 0 };
+
+  return { payload: { ...payload, tools: kept }, strippedCount };
+}
+
+/** Per-target, per-request bound: at most one lite-tool-strip-and-retry cycle. */
+export const MAX_LITE_TOOL_STRIP_RETRIES = 1;
+
+/** Tracks lite-tool-strip-and-retry progress for a single target within one request. */
+export interface LiteToolStripState {
+  attempts: number;
+}
+
+export function createLiteToolStripState(): LiteToolStripState {
+  return { attempts: 0 };
+}
+
+/**
+ * Decides whether an upstream 400 body naming the responses:lite tool-type
+ * restriction should trigger a strip-and-retry cycle against the same
+ * target, recording the attempt in `state` when it does. Returns `false`
+ * when the retry should NOT happen because:
+ *   - the body doesn't name the restriction, OR
+ *   - MAX_LITE_TOOL_STRIP_RETRIES has already been used for this target
+ *     (bounded to exactly one retry — once the disallowed tools are gone, a
+ *     repeat 400 means something else is wrong, so normal failover should
+ *     proceed instead of retrying again).
+ */
+export function planLiteToolStrip(responseBody: string, state: LiteToolStripState): boolean {
+  if (state.attempts >= MAX_LITE_TOOL_STRIP_RETRIES) return false;
+  if (!matchLiteUnsupportedToolsError(responseBody)) return false;
+
+  state.attempts++;
+  return true;
+}
