@@ -1,0 +1,32 @@
+import { getConfig } from '../../config';
+import { ModelMuxIdpProvider } from './modelmux-idp-provider';
+import type { AuthProvider } from './types';
+
+let cachedProvider: AuthProvider | null = null;
+let cachedProviderId: string | null = null;
+
+export function isMcpOAuthEnabled(): boolean {
+  return getConfig().mcpOAuth?.enabled === true;
+}
+
+export function getMcpAuthProvider(): AuthProvider | null {
+  const config = getConfig().mcpOAuth;
+  if (config?.enabled !== true) return null;
+
+  const providerId = config.provider ?? 'modelmux-idp';
+  if (cachedProvider && cachedProviderId === providerId) return cachedProvider;
+
+  switch (providerId) {
+    case 'modelmux-idp':
+      cachedProvider = new ModelMuxIdpProvider();
+      cachedProviderId = providerId;
+      return cachedProvider;
+    default:
+      return null;
+  }
+}
+
+export function resetMcpAuthProviderForTesting(): void {
+  cachedProvider = null;
+  cachedProviderId = null;
+}
