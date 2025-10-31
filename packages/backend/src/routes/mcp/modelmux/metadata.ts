@@ -1,0 +1,81 @@
+import type { ModelMuxToolName } from './types';
+
+export const MODELMUX_MANAGEMENT_PROMPT = `ModelMux is a unified API gateway for LLMs. It exposes OpenAI- and Anthropic-compatible endpoints, provider-native raw endpoints, routes requests to configured providers, records usage, and manages provider, model alias, key, quota, debug, and MCP gateway configuration.
+
+This server is admin-only. Authenticate with the ModelMux ADMIN_KEY, sent as either an x-admin-key header or an Authorization: Bearer <ADMIN_KEY> header. Inference API keys are rejected with 403.
+
+The tools are compact domain tools. Prefer inspection before mutation: list or get the current state, explain the intended change, then call the relevant tool with operation, id, category, query, and body.
+
+Destructive or high-impact operations require destructive: "acknowledged". Secrets are redacted by default. Only request redact: false when you have specific authorization and the operation explicitly supports unredacted output.
+
+Common workflows:
+- Review request activity with modelmux_usage list or summary.
+- Inspect or update provider setup with modelmux_provider list, get, put, update, delete, or fetch_models.
+- Inspect pi-ai provider/model IDs with modelmux_pi_catalog providers, models, or validate_config.
+- Raw provider access uses provider raw_passthrough { enabled, base_url, auth } plus key allowRawPassthrough. It is provider-wide, bypasses model restrictions/routing/failover/transformation, and should be treated as high-impact.
+- Inspect or update model routing with modelmux_model_alias list, get, put, update, delete, or delete_all.
+- Inspect or update inference keys with modelmux_key list, get, put, update, or delete; normal responses redact secrets.
+- Check upstream quota state with modelmux_quota_checker types, list, or get.
+- Inspect or update user quota definitions with modelmux_quota list, get, put, update, or delete; check or repair a key's quota usage with modelmux_quota status, clear, or recompute.
+- Review or update MCP gateway configuration with modelmux_mcp_gateway servers_list, get, put, update, or delete.
+- Inspect general settings with modelmux_settings get and a category.
+- Inspect recent system logs with modelmux_system_logs recent.
+- Inspect or change the runtime logging level with modelmux_system_logs level, set_level, or reset_level.
+- Use modelmux_debug state before enabling debug tracing.
+- Use modelmux_operations backup, restore, refresh_metadata, refresh_catalog, list_cooldowns, or clear_cooldowns for operational actions.
+
+Best practices:
+- Keep changes narrow and reversible.
+- update is additive: send only the fields you are changing. Nested objects (a provider's models, headers, extraBody, quota_checker, compaction, ...) merge key-by-key, a null value removes a field or a single map entry, and arrays replace wholesale. Use put/create when you really mean to replace the whole object.
+- Avoid broad overwrite operations unless necessary.
+- Never expose provider API keys, inference key secrets, cookies, sessions, or OAuth tokens in chat unless specifically authorized.
+- Include enough context in body payloads for future auditability.`;
+
+export const TOOL_NAMES = [
+  'modelmux_config',
+  'modelmux_provider',
+  'modelmux_pi_catalog',
+  'modelmux_model_alias',
+  'modelmux_key',
+  'modelmux_quota',
+  'modelmux_quota_checker',
+  'modelmux_usage',
+  'modelmux_debug',
+  'modelmux_mcp_gateway',
+  'modelmux_settings',
+  'modelmux_system_logs',
+  'modelmux_operations',
+] as const satisfies readonly ModelMuxToolName[];
+
+export function getToolDescription(toolName: string) {
+  switch (toolName) {
+    case 'modelmux_config':
+      return 'Inspect ModelMux configuration and status. Initial operations: get, export, status.';
+    case 'modelmux_provider':
+      return 'Inspect and manage providers and provider routing configuration. Operations: list, get, put, create, update, delete, fetch_models. update merges: body is applied key-by-key, so body.models can hold just the models you are adding or changing (existing models are preserved) and a null model entry removes that one model; arrays replace and a null field clears it. put/create replace the whole provider. Static API-key providers may define raw_passthrough { enabled, base_url, auth } to expose /raw/{provider}/* without routing, failover, adapters, or payload transformation.';
+    case 'modelmux_pi_catalog':
+      return 'Read the merged pi-ai model catalog. Operations: providers, models (id: pi-ai provider ID; optional query.q search), validate_config (checks configured pi_ai_provider and pi_ai_model_id references, including model IDs missing a provider mapping, without changing configuration).';
+    case 'modelmux_model_alias':
+      return 'Inspect and manage model aliases, targets, and target groups. Operations: list, get, put, create, update, delete, delete_all. update merges nested objects and lets a null field clear it, but targets, target_groups, and additional_aliases are arrays and always replace, so send the full list when changing it.';
+    case 'modelmux_key':
+      return 'Inspect and manage inference keys with secrets redacted. Operations: list, get, put, create, update, delete. update merges fields you send (quotas is an array and replaces). Keys carry quotas: string[] to assign one or more quota definitions (legacy singular quota field is still accepted on input and folded into quotas). allowRawPassthrough grants provider-wide raw access to raw-enabled providers permitted by the key provider policy; model restrictions do not apply.';
+    case 'modelmux_quota':
+      return "Inspect and manage user quota definitions, and check or repair per-key quota usage. Operations: list, get, put, create, update, delete, status, clear, recompute. update merges nested objects and a null field clears it; the scope fields are arrays and replace. Quota definitions carry scope fields (allowedProviders, excludedProviders, allowedModels, excludedModels; omitted when unscoped), shared (pooled across keys), and an optional warnAt threshold. status (id: key) returns { key, quotas: [...] } — one entry per quota attached to the key (assigned or default-sourced), each with name, limitType, limit, currentUsage, remaining, allowed, resetsAt, scope, global, shared, source ('assigned' | 'default'), and warnAt (only when set on the definition), plus legacy top-level quota_name/allowed/current_usage/limit/remaining/resets_at fields derived from the most-constrained entry. clear (body: { key, quota? }, destructive: \"acknowledged\") resets usage for one named quota, or every quota attached to the key when quota is omitted. recompute (body: { key, quota }, both required) repairs a quota's cached usage by recalculating from stored request records; it 400s with a reason (e.g. unsupported_quota_type) for leaky rolling tokens/requests quotas that cannot be recomputed, and its windowStartMs is a raw epoch-ms number. clear and recompute 404 when the key does not exist and 400 when the quota is not attached to that key.";
+    case 'modelmux_quota_checker':
+      return 'Inspect upstream provider quota checker configuration. Initial operations: types, list, get.';
+    case 'modelmux_usage':
+      return 'Review request logs and summaries. Operations: list, summary, delete, delete_all. Raw provider calls are distinct from passthrough and report isRaw: true with requestMethod and requestPath.';
+    case 'modelmux_debug':
+      return 'Review and manage debug tracing. Operations: state, update, logs, get_log, delete_log, delete_all_logs. Debug capture targets are in-memory and inclusive: update body may include enabled, keys, aliases, and providers; a request is captured when any enabled dimension matches.';
+    case 'modelmux_mcp_gateway':
+      return 'Inspect and manage ModelMux upstream MCP gateway configuration. Operations: servers_list, list, get, put, create, update, delete, status, start, stop, restart, logs. update merges nested objects and a null field clears it; array fields replace.';
+    case 'modelmux_settings':
+      return 'Inspect ModelMux settings by category. Initial operations: get.';
+    case 'modelmux_system_logs':
+      return 'Inspect recent ModelMux system logs and control runtime log verbosity. Operations: recent, level, set_level, reset_level.';
+    case 'modelmux_operations':
+      return 'Run high-impact operational actions. Operations: backup, restore, restart, refresh_metadata, refresh_catalog, list_cooldowns, clear_cooldowns, reset_logs.';
+    default:
+      return 'ModelMux management tool.';
+  }
+}
