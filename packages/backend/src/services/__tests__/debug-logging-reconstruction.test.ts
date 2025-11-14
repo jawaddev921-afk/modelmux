@@ -1,0 +1,666 @@
+import { beforeEach, describe, expect, it, mock, test } from 'bun:test';
+import { once } from 'node:events';
+
+import { registerSpy } from '../../../test/test-utils';
+import { logger } from '../../utils/logger';
+import { DebugLoggingInspector } from '../inspectors/debug-logging';
+import { DebugManager } from '../observability/debug-manager';
+
+describe('DebugLoggingInspector Reconstruction', () => {
+  const requestId = 'test-reconstruction-id';
+
+  beforeEach(() => {
+    const dm = DebugManager.getInstance();
+    dm.resetForTesting();
+    dm.setEnabled(true);
+  });
+
+  test('does not warn for non-inference responses', async () => {
+    const warnSpy = registerSpy(logger, 'warn');
+    warnSpy.mockClear();
+    const stream = new DebugLoggingInspector(requestId, 'raw').createInspector('unknown');
+    const ended = once(stream, 'end');
+
+    stream.end(Buffer.from('{}'));
+    await ended;
+
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  test('warns for unsupported provider API types', async () => {
+    const warnSpy = registerSpy(logger, 'warn');
+    warnSpy.mockClear();
+    const stream = new DebugLoggingInspector(requestId, 'raw').createInspector('unsupported');
+    const ended = once(stream, 'end');
+
+    stream.end(Buffer.from('{}'));
+    await ended;
+
+    expect(warnSpy).toHaveBeenCalledWith('Unknown providerApiType: unsupported');
+  });
+
+  test('reconstructChatCompletions handles non-streaming JSON', async () => {
+    const inspector = new DebugLoggingInspector(requestId, 'raw');
+    const stream = inspector.createInspector('chat');
+
+    const jsonResponse = {
+      id: 'chatcmpl-123',
+      object: 'chat.completion',
+      choices: [
+        { message: { content: 'hello', tool_calls: [{}, {}] }, finish_reason: 'tool_calls' },
+      ],
+    };
+
+    stream.write(Buffer.from(JSON.stringify(jsonResponse)));
+    stream.end();
+
+    // Small delay for the 'finish' event to process
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const dm = DebugManager.getInstance();
+    const snapshot = dm.getReconstructedRawResponse(requestId);
+    expect(snapshot).not.toBeNull();
+    expect(snapshot.id).toBe('chatcmpl-123');
+    expect(snapshot.choices[0].message.tool_calls).toHaveLength(2);
+  });
+
+  test('reconstructChatCompletions initializes streamed tool arguments before appending', async () => {
+    const inspector = new DebugLoggingInspector(requestId, 'raw');
+    const stream = inspector.createInspector('chat');
+    const ended = once(stream, 'end');
+    const chunks = [
+      {
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'call_1',
+                  type: 'function',
+                  function: { name: 'Read' },
+                },
+              ],
+            },
+            index: 0,
+          },
+        ],
+        id: 'chatcmpl-123',
+        object: 'chat.completion.chunk',
+      },
+      {
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: '',
+                  type: 'function',
+                  function: { name: '', arguments: '{"file_path":"/tmp/hello.txt"}' },
+                },
+              ],
+            },
+            index: 0,
+          },
+        ],
+        id: 'chatcmpl-123',
+        object: 'chat.completion.chunk',
+      },
+    ];
+
+    for (const chunk of chunks) {
+      stream.write(Buffer.from(`data: ${JSON.stringify(chunk)}\n\n`));
+    }
+    stream.end(Buffer.from('data: [DONE]\n\n'));
+    await ended;
+
+    const snapshot = DebugManager.getInstance().getReconstructedRawResponse(requestId);
+    expect(snapshot.choices[0].delta.tool_calls[0].function.arguments).toBe(
+      '{"file_path":"/tmp/hello.txt"}'
+    );
+  });
+
+  test('reconstructMessages handles non-streaming JSON (Anthropic style)', async () => {
+    const inspector = new DebugLoggingInspector(requestId, 'raw');
+    const stream = inspector.createInspector('messages');
+
+    const jsonResponse = {
+      id: 'msg_123',
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'hi' },
+        { type: 'tool_use', id: 't1' },
+      ],
+      stop_reason: 'tool_use',
+    };
+
+    stream.write(Buffer.from(JSON.stringify(jsonResponse)));
+    stream.end();
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const dm = DebugManager.getInstance();
+    const snapshot = dm.getReconstructedRawResponse(requestId);
+    expect(snapshot).not.toBeNull();
+    expect(snapshot.id).toBe('msg_123');
+    expect(snapshot.stop_reason).toBe('tool_use');
+  });
+
+  test('reconstructGemini handles non-streaming JSON', async () => {
+    const inspector = new DebugLoggingInspector(requestId, 'raw');
+    const stream = inspector.createInspector('gemini');
+
+    const jsonResponse = {
+      candidates: [
+        {
+          content: { parts: [{ text: 'thinking' }, { functionCall: { name: 'fn' } }] },
+          finishReason: 'STOP',
+        },
+      ],
+    };
+
+    stream.write(Buffer.from(JSON.stringify(jsonResponse)));
+    stream.end();
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const dm = DebugManager.getInstance();
+    const snapshot = dm.getReconstructedRawResponse(requestId);
+    expect(snapshot).not.toBeNull();
+    expect(snapshot.candidates[0].finishReason).toBe('STOP');
+  });
+
+  describe('reconstructResponses streaming (Responses API)', () => {
+    const writeEvents = (stream: any, events: any[]) => {
+      for (const event of events) {
+        stream.write(Buffer.from(`data: ${JSON.stringify(event)}\n\n`));
+      }
+      stream.end();
+    };
+
+    test('finalizes a completed Responses stream before the transport ends', () => {
+      const completedRequestId = 'test-responses-completed-before-end';
+      const onTerminal = mock();
+      const inspector = new DebugLoggingInspector(completedRequestId, 'raw', onTerminal);
+      const stream = inspector.createInspector('responses');
+      const completedEvent = `data: ${JSON.stringify({
+        type: 'response.completed',
+        response: {
+          id: 'resp_completed',
+          object: 'response',
+          status: 'completed',
+          model: 'gpt-4o',
+          output: [],
+          usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+        },
+      })}\n\n`;
+
+      stream.write(Buffer.from(completedEvent.slice(0, 40)));
+      expect(DebugManager.getInstance().getReconstructedRawResponse(completedRequestId)).toBeNull();
+
+      stream.write(Buffer.from(completedEvent.slice(40)));
+
+      const log = DebugManager.getInstance().getPendingLog(completedRequestId);
+      expect(onTerminal).toHaveBeenCalledTimes(1);
+      expect(log?.rawResponse).toBe(completedEvent);
+      expect(log?.rawResponseSnapshot).toMatchObject({
+        id: 'resp_completed',
+        status: 'completed',
+        usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+      });
+      stream.destroy();
+    });
+
+    test('response.failed captures status, error, and usage (mid-stream failure)', async () => {
+      const failedRequestId = 'test-responses-failed';
+      const inspector = new DebugLoggingInspector(failedRequestId, 'raw');
+      const stream = inspector.createInspector('responses');
+
+      writeEvents(stream, [
+        {
+          type: 'response.created',
+          response: {
+            id: 'resp_test123',
+            object: 'response',
+            created_at: 1700000000,
+            status: 'in_progress',
+            model: 'gpt-4o',
+            output: [],
+          },
+        },
+        {
+          type: 'response.output_item.added',
+          output_index: 0,
+          item: {
+            id: 'msg_1',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: '' }],
+          },
+        },
+        {
+          type: 'response.output_text.delta',
+          output_index: 0,
+          content_index: 0,
+          delta: 'Partial answer before it broke',
+        },
+        {
+          type: 'response.failed',
+          response: {
+            id: 'resp_test123',
+            object: 'response',
+            created_at: 1700000000,
+            status: 'failed',
+            model: 'gpt-4o',
+            output: [
+              {
+                id: 'msg_1',
+                type: 'message',
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'Partial answer before it broke' }],
+              },
+            ],
+            error: { code: 'server_error', message: 'The model response failed to complete.' },
+            usage: {
+              input_tokens: 42,
+              output_tokens: 8,
+              total_tokens: 50,
+              input_tokens_details: { cached_tokens: 0 },
+              output_tokens_details: { reasoning_tokens: 0 },
+            },
+          },
+        },
+      ]);
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const dm = DebugManager.getInstance();
+      const snapshot = dm.getReconstructedRawResponse(failedRequestId);
+      expect(snapshot).not.toBeNull();
+      expect(snapshot.status).toBe('failed');
+      expect(snapshot.error).toEqual({
+        code: 'server_error',
+        message: 'The model response failed to complete.',
+      });
+      expect(snapshot.usage).toEqual({
+        input_tokens: 42,
+        output_tokens: 8,
+        total_tokens: 50,
+        input_tokens_details: { cached_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: 0 },
+      });
+    });
+
+    test('response.failed with NO usage captures status and error, and absent usage stays absent', async () => {
+      const failedNoUsageRequestId = 'test-responses-failed-no-usage';
+      const inspector = new DebugLoggingInspector(failedNoUsageRequestId, 'raw');
+      const stream = inspector.createInspector('responses');
+
+      writeEvents(stream, [
+        {
+          type: 'response.created',
+          response: {
+            id: 'resp_nousage_1',
+            object: 'response',
+            created_at: 1700000000,
+            status: 'in_progress',
+            model: 'gpt-4o',
+            output: [],
+          },
+        },
+        {
+          type: 'response.output_item.added',
+          output_index: 0,
+          item: {
+            id: 'msg_1',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: '' }],
+          },
+        },
+        {
+          type: 'response.output_text.delta',
+          output_index: 0,
+          content_index: 0,
+          delta: 'Partial answer before it broke',
+        },
+        {
+          type: 'response.failed',
+          response: {
+            id: 'resp_nousage_1',
+            object: 'response',
+            created_at: 1700000000,
+            status: 'failed',
+            model: 'gpt-4o',
+            output: [
+              {
+                id: 'msg_1',
+                type: 'message',
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'Partial answer before it broke' }],
+              },
+            ],
+            error: { code: 'server_error', message: 'The model response failed to complete.' },
+            // No usage at all — the upstream failed before reporting any.
+          },
+        },
+      ]);
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const dm = DebugManager.getInstance();
+      const snapshot = dm.getReconstructedRawResponse(failedNoUsageRequestId);
+      expect(snapshot).not.toBeNull();
+      expect(snapshot.status).toBe('failed');
+      expect(snapshot.error).toEqual({
+        code: 'server_error',
+        message: 'The model response failed to complete.',
+      });
+      // Usage was never reported anywhere in the stream: it must stay
+      // ABSENT on the snapshot (no phantom `usage` own property either),
+      // locking in the optional-usage contract downstream consumers
+      // (usage-logging) rely on.
+      expect(snapshot.usage).toBeUndefined();
+      expect(snapshot).not.toHaveProperty('usage');
+    });
+
+    test('response.incomplete captures status, incomplete_details, and usage (max_output_tokens truncation)', async () => {
+      const incompleteRequestId = 'test-responses-incomplete';
+      const inspector = new DebugLoggingInspector(incompleteRequestId, 'raw');
+      const stream = inspector.createInspector('responses');
+
+      writeEvents(stream, [
+        {
+          type: 'response.created',
+          response: {
+            id: 'resp_test789',
+            object: 'response',
+            created_at: 1700000000,
+            status: 'in_progress',
+            model: 'gpt-4o',
+            output: [],
+          },
+        },
+        {
+          type: 'response.output_item.added',
+          output_index: 0,
+          item: {
+            id: 'msg_1',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: '' }],
+          },
+        },
+        {
+          type: 'response.output_text.delta',
+          output_index: 0,
+          content_index: 0,
+          delta: 'Truncated answer that ran out of ',
+        },
+        {
+          type: 'response.incomplete',
+          response: {
+            id: 'resp_test789',
+            object: 'response',
+            created_at: 1700000000,
+            status: 'incomplete',
+            model: 'gpt-4o',
+            output: [
+              {
+                id: 'msg_1',
+                type: 'message',
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'Truncated answer that ran out of ' }],
+              },
+            ],
+            incomplete_details: { reason: 'max_output_tokens' },
+            usage: {
+              input_tokens: 30,
+              output_tokens: 16,
+              total_tokens: 46,
+              input_tokens_details: { cached_tokens: 0 },
+              output_tokens_details: { reasoning_tokens: 0 },
+            },
+          },
+        },
+      ]);
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const dm = DebugManager.getInstance();
+      const snapshot = dm.getReconstructedRawResponse(incompleteRequestId);
+      expect(snapshot).not.toBeNull();
+      expect(snapshot.status).toBe('incomplete');
+      expect(snapshot.incomplete_details).toEqual({ reason: 'max_output_tokens' });
+      expect(snapshot.usage).toEqual({
+        input_tokens: 30,
+        output_tokens: 16,
+        total_tokens: 46,
+        input_tokens_details: { cached_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: 0 },
+      });
+    });
+
+    test('response.completed still captures status and usage (regression)', async () => {
+      const completedRequestId = 'test-responses-completed';
+      const inspector = new DebugLoggingInspector(completedRequestId, 'raw');
+      const stream = inspector.createInspector('responses');
+
+      writeEvents(stream, [
+        {
+          type: 'response.created',
+          response: {
+            id: 'resp_test456',
+            object: 'response',
+            created_at: 1700000000,
+            status: 'in_progress',
+            model: 'gpt-4o',
+            output: [],
+          },
+        },
+        {
+          type: 'response.completed',
+          response: {
+            id: 'resp_test456',
+            object: 'response',
+            created_at: 1700000000,
+            status: 'completed',
+            model: 'gpt-4o',
+            output: [
+              {
+                id: 'msg_1',
+                type: 'message',
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'Full answer' }],
+              },
+            ],
+            usage: {
+              input_tokens: 42,
+              output_tokens: 20,
+              total_tokens: 62,
+              input_tokens_details: { cached_tokens: 0 },
+              output_tokens_details: { reasoning_tokens: 0 },
+            },
+          },
+        },
+      ]);
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const dm = DebugManager.getInstance();
+      const snapshot = dm.getReconstructedRawResponse(completedRequestId);
+      expect(snapshot).not.toBeNull();
+      expect(snapshot.status).toBe('completed');
+      expect(snapshot.error).toBeUndefined();
+      expect(snapshot.usage).toEqual({
+        input_tokens: 42,
+        output_tokens: 20,
+        total_tokens: 62,
+        input_tokens_details: { cached_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: 0 },
+      });
+    });
+
+    test('response.completed preserves output items when its output array is empty', async () => {
+      const completedRequestId = 'test-responses-completed-empty-output';
+      const inspector = new DebugLoggingInspector(completedRequestId, 'raw');
+      const stream = inspector.createInspector('responses');
+
+      writeEvents(stream, [
+        {
+          type: 'response.created',
+          response: {
+            id: 'resp_tools',
+            object: 'response',
+            status: 'in_progress',
+            model: 'gpt-5-codex',
+            output: [],
+          },
+        },
+        {
+          type: 'response.output_item.added',
+          output_index: 0,
+          item: {
+            id: 'fc_1',
+            type: 'function_call',
+            call_id: 'call_1',
+            name: 'lookup',
+            arguments: '',
+          },
+        },
+        {
+          type: 'response.function_call_arguments.delta',
+          output_index: 0,
+          delta: '{}',
+        },
+        {
+          type: 'response.output_item.done',
+          output_index: 0,
+          item: {
+            id: 'fc_1',
+            type: 'function_call',
+            call_id: 'call_1',
+            name: 'lookup',
+            arguments: '{}',
+            status: 'completed',
+          },
+        },
+        {
+          type: 'response.completed',
+          response: {
+            id: 'resp_tools',
+            object: 'response',
+            status: 'completed',
+            model: 'gpt-5-codex',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          },
+        },
+      ]);
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const snapshot = DebugManager.getInstance().getReconstructedRawResponse(completedRequestId);
+      expect(snapshot.output).toEqual([
+        {
+          id: 'fc_1',
+          type: 'function_call',
+          call_id: 'call_1',
+          name: 'lookup',
+          arguments: '{}',
+          status: 'completed',
+        },
+      ]);
+      expect(snapshot.usage).toEqual({ input_tokens: 10, output_tokens: 5, total_tokens: 15 });
+    });
+  });
+
+  describe('reconstructChatCompletions streaming terminal finalization', () => {
+    test('finalizes a completed chat stream before the transport ends', () => {
+      const completedRequestId = 'test-chat-completed-before-end';
+      const onTerminal = mock();
+      const inspector = new DebugLoggingInspector(completedRequestId, 'raw', onTerminal);
+      const stream = inspector.createInspector('chat');
+      const usageFrame = `data: ${JSON.stringify({
+        id: 'chatcmpl_completed',
+        object: 'chat.completion.chunk',
+        model: 'deepseek-v4.1-flash',
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 42, completion_tokens: 7, total_tokens: 49 },
+      })}\n\n`;
+      const doneFrame = 'data: [DONE]\n\n';
+      const fullBody = `${usageFrame}${doneFrame}`;
+
+      stream.write(Buffer.from(fullBody.slice(0, 40)));
+      // A usage-bearing frame alone must not finalize: only the terminal
+      // `[DONE]` frame does.
+      expect(DebugManager.getInstance().getReconstructedRawResponse(completedRequestId)).toBeNull();
+
+      stream.write(Buffer.from(fullBody.slice(40)));
+
+      const log = DebugManager.getInstance().getPendingLog(completedRequestId);
+      expect(onTerminal).toHaveBeenCalledTimes(1);
+      expect(log?.rawResponse).toBe(fullBody);
+      expect(log?.rawResponseSnapshot).toMatchObject({
+        id: 'chatcmpl_completed',
+        choices: [{ finish_reason: 'stop' }],
+        usage: { prompt_tokens: 42, completion_tokens: 7, total_tokens: 49 },
+      });
+      stream.destroy();
+    });
+
+    test('does not finalize a chat stream on a non-terminal data frame', () => {
+      const requestIdOpen = 'test-chat-no-terminal';
+      const onTerminal = mock();
+      const inspector = new DebugLoggingInspector(requestIdOpen, 'raw', onTerminal);
+      const stream = inspector.createInspector('chat');
+
+      stream.write(
+        Buffer.from(
+          `data: ${JSON.stringify({
+            id: 'chatcmpl_open',
+            object: 'chat.completion.chunk',
+            choices: [{ index: 0, delta: { content: 'hello' } }],
+          })}\n\n`
+        )
+      );
+
+      expect(onTerminal).not.toHaveBeenCalled();
+      expect(DebugManager.getInstance().getReconstructedRawResponse(requestIdOpen)).toBeNull();
+      stream.destroy();
+    });
+
+    test('detects the terminal frame after the debug body is truncated', async () => {
+      const truncatedRequestId = 'test-chat-terminal-after-truncation';
+      const onTerminal = mock();
+      const inspector = new DebugLoggingInspector(truncatedRequestId, 'raw', onTerminal);
+      const stream = inspector.createInspector('chat');
+      const write = (value: string) =>
+        new Promise<void>((resolve, reject) => {
+          stream.write(Buffer.from(value), (error) => {
+            if (error) reject(error);
+            else resolve();
+          });
+        });
+      const filler = `data: ${JSON.stringify({
+        id: 'chatcmpl_big',
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: { content: 'x'.repeat(1024 * 1024) } }],
+      })}\n\n`;
+
+      // Push the capture past the 10MB debug buffer limit.
+      for (let i = 0; i < 11; i++) {
+        await write(filler);
+      }
+      expect(onTerminal).not.toHaveBeenCalled();
+
+      await write('data: [DONE]\n\n');
+
+      expect(onTerminal).toHaveBeenCalledTimes(1);
+      const log = DebugManager.getInstance().getPendingLog(truncatedRequestId);
+      expect(log?.rawResponse).toContain('[DEBUG OUTPUT TRUNCATED');
+      stream.destroy();
+    });
+  });
+});
