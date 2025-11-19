@@ -1,0 +1,1004 @@
+import { afterEach, beforeAll, describe, expect, it, test } from 'bun:test';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import {
+  applyProviderPreset,
+  findProviderPreset,
+  findUnresolvedPresetVars,
+  PiAiQuirksSchema,
+  type ProviderPreset,
+  type ProviderPresetDraft,
+  ProviderPresetSchema,
+  substitutePresetVars,
+} from '@modelmux/shared';
+import addFormats from 'ajv-formats';
+import Ajv2020 from 'ajv/dist/2020.js';
+
+import editorSchema from '../../data/provider-presets.schema.json' with { type: 'json' };
+import { applyRegistryAutoCompat } from '../services/dispatch/dispatcher-auto-compat';
+import {
+  defaultPresetsPath,
+  diskFileEditedSinceStartup,
+  loadLocalPresets,
+  loadProviderPresets,
+  parseAndValidatePresets,
+  REMOTE_PRESETS_URL,
+} from '../services/provider-presets';
+
+let catalog: ProviderPreset[] = [];
+
+beforeAll(async () => {
+  catalog = await loadLocalPresets();
+});
+
+const blankDraft = (): ProviderPresetDraft => ({
+  id: '',
+  name: '',
+  apiBaseUrl: {},
+  apiKey: '',
+  oauthProvider: '',
+  type: [],
+  pi_ai_provider: undefined,
+  pi_ai_quirks: undefined,
+  auto_compat: undefined,
+});
+
+const presetOrThrow = (id: string): ProviderPreset => {
+  const preset = findProviderPreset(catalog, id);
+  if (!preset) throw new Error(`preset '${id}' missing from catalog`);
+  return preset;
+};
+
+const remoteEntry = {
+  id: 'remote-only',
+  name: 'Remote Only',
+  suggestedProviderId: 'remote-only',
+  suggestedName: 'Remote Only',
+  apiBaseUrl: { chat: 'https://remote.test/v1' },
+  piAiProvider: 'openai',
+  autoCompat: true,
+};
+
+const inlineEntry = {
+  id: 'inline',
+  name: 'Inline',
+  suggestedProviderId: 'inline',
+  suggestedName: 'Inline',
+  apiBaseUrl: {
+    chat: 'https://inline.test/v1',
+    messages: 'https://inline.test/anthropic/v1',
+  },
+  piAiQuirks: {
+    chat: {
+      api: 'openai-completions',
+      reasoning: true,
+      thinkingLevelMap: { off: null, high: 'high' },
+      compat: { maxTokensField: 'max_completion_tokens' },
+      models: {
+        'team/model-1': {
+          thinkingLevelMap: { low: 'low' },
+          compat: { supportsTemperature: false },
+        },
+      },
+    },
+    messages: {
+      api: 'anthropic-messages',
+      models: { 'team/model-1': { reasoning: true, maxTokens: 4096 } },
+    },
+  },
+};
+
+const plainEntry = {
+  id: 'plain',
+  name: 'Plain',
+  suggestedProviderId: 'plain',
+  suggestedName: 'Plain',
+  apiBaseUrl: { chat: 'https://plain.test/v1' },
+};
+
+const editorCatalog = (entry: unknown) => ({
+  $schema: editorSchema.$id,
+  presets: [entry],
+});
+
+const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false });
+addFormats(ajv);
+const validateEditorCatalog = ajv.compile(editorSchema);
+
+describe('built-in presets catalog (data/provider-presets.json)', () => {
+  test('loads a non-empty catalog from the default path', async () => {
+    expect(defaultPresetsPath().endsWith(join('data', 'provider-presets.json'))).toBe(true);
+    expect(catalog.length).toBeGreaterThan(0);
+  });
+
+  test('every URL is a valid http(s) URL once template vars are filled', () => {
+    for (const preset of catalog) {
+      const filled = substitutePresetVars(
+        preset.apiBaseUrl,
+        Object.fromEntries(preset.templateVars.map((variable) => [variable.key, 'test']))
+      );
+      for (const [apiType, url] of Object.entries(filled)) {
+        expect(url, `${preset.id}.${apiType} has an unsubstituted placeholder`).not.toContain('{');
+        const parsed = new URL(url);
+        expect(['http:', 'https:']).toContain(parsed.protocol);
+        expect(parsed.search, `${preset.id}.${apiType} must not carry a query`).toBe('');
+        expect(parsed.hash, `${preset.id}.${apiType} must not carry a fragment`).toBe('');
+      }
+    }
+  });
+
+  test('spot-checks on researched endpoint maps', () => {
+    expect(presetOrThrow('anthropic').apiBaseUrl).toEqual({
+      messages: 'https://api.anthropic.com/v1',
+    });
+    // Anthropic-compatible bases carry /v1 because ModelMux appends /messages.
+    expect(presetOrThrow('moonshot').apiBaseUrl.messages).toBe(
+      'https://api.moonshot.ai/anthropic/v1'
+    );
+    expect(presetOrThrow('openrouter').apiBaseUrl['systemone']).toBe(
+      'https://openrouter.ai/api/v1'
+    );
+    // DeepSeek chat has no /v1 segment upstream.
+    expect(presetOrThrow('deepseek').apiBaseUrl.chat).toBe('https://api.deepseek.com');
+  });
+
+  test('requesty declares inline quirks instead of borrowing the openrouter catalog', () => {
+    const requesty = presetOrThrow('requesty');
+    expect(requesty.piAiProvider).toBeUndefined();
+    expect(requesty.autoCompat).toBe(true);
+    expect(Object.keys(requesty.piAiQuirks ?? {}).sort()).toEqual([
+      'chat',
+      'messages',
+      'responses',
+    ]);
+
+    const project = (targetApiType: string, body: Record<string, unknown>) =>
+      applyRegistryAutoCompat(
+        body,
+        { model: 'alias', messages: [], incomingApiType: targetApiType } as any,
+        {
+          provider: 'requesty',
+          model: 'anthropic/claude-sonnet-4-5',
+          config: { auto_compat: true, pi_ai_quirks: requesty.piAiQuirks } as any,
+        } as any,
+        targetApiType
+      );
+
+    // Requesty chat reads top-level reasoning_effort; it ignores the OpenRouter
+    // reasoning object on Anthropic models and its router rejects "minimal".
+    const chat = project('chat', { reasoning: { effort: 'high' } });
+    expect(chat.reasoning).toBeUndefined();
+    expect(chat.reasoning_effort).toBe('high');
+    expect(requesty.piAiQuirks?.chat?.thinkingLevelMap?.minimal).toBeNull();
+
+    const messages = project('messages', { max_tokens: 4000, reasoning_effort: 'low' });
+    expect(messages.thinking).toMatchObject({ type: 'enabled', budget_tokens: 2048 });
+  });
+
+  test('opper declares inline quirks with a messages base under /v3/compat/v1', () => {
+    const opper = presetOrThrow('opper');
+    expect(opper.piAiProvider).toBeUndefined();
+    expect(opper.autoCompat).toBe(true);
+    expect(Object.keys(opper.piAiQuirks ?? {}).sort()).toEqual(['chat', 'messages', 'responses']);
+    // ModelMux appends /messages, and Opper serves Anthropic messages at /v3/compat/v1/messages.
+    expect(opper.apiBaseUrl).toEqual({
+      chat: 'https://api.opper.ai/v3/compat',
+      messages: 'https://api.opper.ai/v3/compat/v1',
+      responses: 'https://api.opper.ai/v3/compat',
+    });
+
+    const project = (targetApiType: string, body: Record<string, unknown>) =>
+      applyRegistryAutoCompat(
+        body,
+        { model: 'alias', messages: [], incomingApiType: targetApiType } as any,
+        {
+          provider: 'opper',
+          model: 'claude-sonnet-4-6',
+          config: { auto_compat: true, pi_ai_quirks: opper.piAiQuirks } as any,
+        } as any,
+        targetApiType
+      );
+
+    // Opper chat reads top-level reasoning_effort with low, medium or high,
+    // so minimal is sent as low.
+    const chat = project('chat', { reasoning: { effort: 'high' } });
+    expect(chat.reasoning).toBeUndefined();
+    expect(chat.reasoning_effort).toBe('high');
+    expect(opper.piAiQuirks?.chat?.thinkingLevelMap?.minimal).toBe('low');
+
+    const messages = project('messages', { max_tokens: 4000, reasoning_effort: 'low' });
+    expect(messages.thinking).toMatchObject({ type: 'enabled', budget_tokens: 2048 });
+  });
+});
+
+describe('service tier preset seeds', () => {
+  const project = (
+    quirks: ProviderPreset['piAiQuirks'],
+    targetApiType: string,
+    model: string,
+    body: Record<string, unknown>
+  ) =>
+    applyRegistryAutoCompat(
+      body,
+      { model, messages: [], incomingApiType: targetApiType } as any,
+      {
+        provider: 'preset-test',
+        model,
+        config: { auto_compat: true, pi_ai_quirks: quirks } as any,
+      } as any,
+      targetApiType
+    );
+
+  test('openai keeps the builtin provider and adds an overlay service tier map', () => {
+    const openai = presetOrThrow('openai');
+    expect(openai.piAiProvider).toBe('openai');
+    expect(openai.piAiQuirks).toBeDefined();
+
+    // Applying the preset must retain BOTH sources: the pi-ai builtin lookup
+    // and the inline overlay that maps per-model tier support.
+    const applied = applyProviderPreset(blankDraft(), openai);
+    expect(applied.pi_ai_provider).toBe('openai');
+    expect(applied.pi_ai_quirks).toEqual(openai.piAiQuirks);
+    expect(applied.auto_compat).toBe(true);
+
+    const safeMap = {
+      auto: 'auto',
+      standard: 'default',
+      flex: null,
+      priority: null,
+      ultrafast: null,
+    };
+    expect(openai.piAiQuirks?.chat?.serviceTierMap).toEqual(safeMap);
+    expect(openai.piAiQuirks?.responses?.serviceTierMap).toEqual(safeMap);
+    expect(openai.piAiQuirks?.chat?.compat?.serviceTierFormat).toBe('service-tier');
+    expect(openai.piAiQuirks?.responses?.compat?.serviceTierFormat).toBe('service-tier');
+
+    // A model override replaces the whole map, so it repeats auto/standard and
+    // lists only the premium tiers proven for that model + endpoint.
+    const responsesModels = openai.piAiQuirks?.responses?.models;
+    expect(responsesModels?.['gpt-6-astra']?.serviceTierMap).toEqual({
+      auto: 'auto',
+      standard: 'default',
+      flex: 'flex',
+      priority: 'priority',
+      ultrafast: 'ultrafast',
+    });
+    expect(responsesModels?.['gpt-5.5-pro']?.serviceTierMap).toEqual({
+      auto: 'auto',
+      standard: 'default',
+      flex: 'flex',
+    });
+    expect(responsesModels?.['gpt-4.1']?.serviceTierMap).toEqual({
+      auto: 'auto',
+      standard: 'default',
+      priority: 'priority',
+    });
+
+    // Chat Completions: the *-pro models are Responses-only and ultrafast is
+    // Responses-only, so neither is declared on the chat target.
+    const chatModels = openai.piAiQuirks?.chat?.models;
+    expect(chatModels?.['gpt-5.5-pro']).toBeUndefined();
+    expect(chatModels?.['gpt-5.4-pro']).toBeUndefined();
+    expect(chatModels?.['gpt-6-astra']?.serviceTierMap).toEqual({
+      auto: 'auto',
+      standard: 'default',
+      flex: 'flex',
+      priority: 'priority',
+    });
+  });
+
+  test('backfills models.dev priority declarations without inferring flex or reasoning modes', () => {
+    // models.dev providers/openai/models/{gpt-5.3-codex,gpt-5.6}.toml
+    // declare fast as service_tier: priority. GPT-5.6 pro is reasoning.mode,
+    // not a service tier. Missing catalog declarations do not revoke existing maps.
+    const openai = presetOrThrow('openai');
+    const expected = { auto: 'auto', standard: 'default', priority: 'priority' };
+    const applied = applyProviderPreset(blankDraft(), openai);
+    expect(applied.pi_ai_provider).toBe('openai');
+    expect(applied.auto_compat).toBe(true);
+    for (const [api, model] of [
+      ['chat', 'gpt-5.6'],
+      ['responses', 'gpt-5.6'],
+      ['responses', 'gpt-5.3-codex'],
+    ] as const) {
+      expect(applied.pi_ai_quirks?.[api]?.models?.[model]?.serviceTierMap).toEqual(expected);
+      expect(
+        project(openai.piAiQuirks, api, model, { service_tier: 'priority' }).service_tier
+      ).toBe('priority');
+      expect(project(openai.piAiQuirks, api, model, { service_tier: 'flex' }).service_tier).toBe(
+        'default'
+      );
+      expect(
+        project(openai.piAiQuirks, api, model, { service_tier: 'ultrafast' }).service_tier
+      ).toBe('priority');
+    }
+    expect(openai.piAiQuirks?.chat?.models?.['gpt-5.3-codex']).toBeUndefined();
+    expect(
+      project(openai.piAiQuirks, 'chat', 'gpt-5.3-codex', { service_tier: 'priority' }).service_tier
+    ).toBe('default');
+  });
+
+  test('openai projects documented tiers and never leaks an unsupported one', () => {
+    const quirks = presetOrThrow('openai').piAiQuirks;
+    expect(
+      project(quirks, 'responses', 'gpt-6-astra', { service_tier: 'ultrafast' }).service_tier
+    ).toBe('ultrafast');
+    expect(project(quirks, 'chat', 'gpt-5.5', { service_tier: 'flex' }).service_tier).toBe('flex');
+    // gpt-4.1 has no flex endpoint: fall back to the standard tier.
+    expect(project(quirks, 'responses', 'gpt-4.1', { service_tier: 'flex' }).service_tier).toBe(
+      'default'
+    );
+    // gpt-5.5 supports flex + priority but not ultrafast: downgrade to priority.
+    expect(
+      project(quirks, 'responses', 'gpt-5.5', { service_tier: 'ultrafast' }).service_tier
+    ).toBe('priority');
+    // gpt-5.5-pro is Responses-only: a chat flex request falls back to standard.
+    expect(project(quirks, 'chat', 'gpt-5.5-pro', { service_tier: 'flex' }).service_tier).toBe(
+      'default'
+    );
+    // ultrafast is Responses-only: a chat request falls back to priority.
+    expect(project(quirks, 'chat', 'gpt-6-astra', { service_tier: 'ultrafast' }).service_tier).toBe(
+      'priority'
+    );
+  });
+
+  test('anthropic keeps the builtin provider and gates fast mode per model', () => {
+    const anthropic = presetOrThrow('anthropic');
+    expect(anthropic.piAiProvider).toBe('anthropic');
+    const applied = applyProviderPreset(blankDraft(), anthropic);
+    expect(applied.pi_ai_provider).toBe('anthropic');
+    expect(applied.pi_ai_quirks).toEqual(anthropic.piAiQuirks);
+
+    expect(anthropic.piAiQuirks?.messages?.compat?.serviceTierFormat).toBe('anthropic-speed');
+    // The docs never accept speed:"standard" as a request value, so the base
+    // map is all null and only evidenced fast-mode models get an override.
+    expect(anthropic.piAiQuirks?.messages?.serviceTierMap).toEqual({
+      auto: null,
+      standard: null,
+      flex: null,
+      priority: null,
+      ultrafast: null,
+    });
+    for (const model of ['claude-opus-5-5', 'claude-opus-5', 'claude-opus-4-8']) {
+      expect(anthropic.piAiQuirks?.messages?.models?.[model]?.serviceTierMap).toEqual({
+        priority: 'fast',
+      });
+    }
+  });
+
+  test('anthropic writes fast mode only for eligible models and preserves service_tier', () => {
+    const quirks = presetOrThrow('anthropic').piAiQuirks;
+    expect(project(quirks, 'messages', 'claude-opus-5', { speed: 'fast' }).speed).toBe('fast');
+    // Opus 4.7 rejects speed:"fast", so the unsupported intent is stripped.
+    expect(project(quirks, 'messages', 'claude-opus-4-7', { speed: 'fast' }).speed).toBeUndefined();
+    // Capacity service_tier is independent of fast mode and survives.
+    expect(
+      project(quirks, 'messages', 'claude-opus-5', { service_tier: 'auto' }).service_tier
+    ).toBe('auto');
+  });
+
+  test('openrouter applies one gateway tier policy across all three APIs', () => {
+    const openrouter = presetOrThrow('openrouter');
+    expect(openrouter.piAiProvider).toBe('openrouter');
+    const applied = applyProviderPreset(blankDraft(), openrouter);
+    expect(applied.pi_ai_provider).toBe('openrouter');
+    expect(applied.pi_ai_quirks).toEqual(openrouter.piAiQuirks);
+
+    const policy = {
+      auto: null,
+      standard: 'default',
+      flex: 'flex',
+      priority: 'priority',
+      ultrafast: 'ultrafast',
+    };
+    for (const target of ['chat', 'messages', 'responses'] as const) {
+      expect(openrouter.piAiQuirks?.[target]?.serviceTierMap).toEqual(policy);
+      expect(openrouter.piAiQuirks?.[target]?.compat?.serviceTierFormat).toBe('service-tier');
+    }
+
+    // Messages carries the OpenAI-style service_tier OpenRouter documents, not
+    // Anthropic's native speed field.
+    expect(
+      project(openrouter.piAiQuirks, 'messages', 'openai/gpt-5', { service_tier: 'flex' })
+        .service_tier
+    ).toBe('flex');
+    expect(
+      project(openrouter.piAiQuirks, 'chat', 'openai/gpt-5', { service_tier: 'priority' })
+        .service_tier
+    ).toBe('priority');
+    expect(
+      project(openrouter.piAiQuirks, 'responses', 'openai/gpt-6-astra', {
+        service_tier: 'ultrafast',
+      }).service_tier
+    ).toBe('ultrafast');
+  });
+});
+
+describe('loadLocalPresets failures', () => {
+  test('missing disk file falls back to the embedded catalog (release binaries)', async () => {
+    const presets = await loadLocalPresets(join(tmpdir(), 'no-such-presets.json'));
+    expect(presets.length).toBe(catalog.length);
+    expect(presets.map((preset) => preset.id)).toEqual(catalog.map((preset) => preset.id));
+  });
+
+  test('malformed JSON throws a descriptive error', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'presets-'));
+    const file = join(dir, 'presets.json');
+    writeFileSync(file, '{ not json');
+    await expect(loadLocalPresets(file)).rejects.toThrow(/unreadable/);
+  });
+
+  test('schema violations and duplicate ids throw with detail', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'presets-'));
+    const invalidFile = join(dir, 'invalid.json');
+    writeFileSync(invalidFile, JSON.stringify({ presets: [{ id: 'broken', apiBaseUrl: {} }] }));
+    await expect(loadLocalPresets(invalidFile)).rejects.toThrow(/Invalid provider presets/);
+
+    const entry = {
+      id: 'dup',
+      name: 'Dup',
+      suggestedProviderId: 'dup',
+      suggestedName: 'Dup',
+      apiBaseUrl: { chat: 'https://example.test/v1' },
+      piAiProvider: 'openai',
+      autoCompat: true,
+    };
+    const dupFile = join(dir, 'dup.json');
+    writeFileSync(dupFile, JSON.stringify({ presets: [entry, entry] }));
+    await expect(loadLocalPresets(dupFile)).rejects.toThrow(/Duplicate provider preset id/);
+  });
+});
+
+describe('diskFileEditedSinceStartup', () => {
+  test('fresh files count as edited, pristine catalog does not', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'presets-'));
+    const fresh = join(dir, 'fresh.json');
+    writeFileSync(fresh, '{}');
+    expect(await diskFileEditedSinceStartup(fresh)).toBe(true);
+    expect(await diskFileEditedSinceStartup(defaultPresetsPath())).toBe(false);
+    expect(await diskFileEditedSinceStartup(join(dir, 'missing.json'))).toBe(false);
+  });
+});
+
+describe('loadProviderPresets remote source', () => {
+  let handler: (req: Request) => Response = () =>
+    new Response(JSON.stringify({ presets: [remoteEntry] }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  let server: ReturnType<typeof Bun.serve> | undefined;
+
+  afterEach(() => {
+    server?.stop(true);
+    server = undefined;
+    handler = () =>
+      new Response(JSON.stringify({ presets: [remoteEntry] }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+  });
+
+  const serve = () => {
+    server = Bun.serve({
+      port: 0,
+      hostname: '127.0.0.1',
+      fetch: (req) => handler(req),
+    });
+    return `http://127.0.0.1:${server.port}/presets.json`;
+  };
+
+  test('default source is the modelmux repo raw GitHub URL', () => {
+    expect(REMOTE_PRESETS_URL).toBe(
+      'https://raw.githubusercontent.com/jawaddev921-afk/modelmux/main/packages/backend/data/provider-presets.json'
+    );
+  });
+
+  test('serves the remote catalog on success', async () => {
+    const result = await loadProviderPresets(serve());
+    expect(result.source).toBe('remote');
+    expect(result.presets).toEqual([
+      expect.objectContaining({ id: 'remote-only', piAiProvider: 'openai' }),
+    ]);
+  });
+
+  test('unreachable remote, error status, and bad content fall back to built-in', async () => {
+    const unreachable = await loadProviderPresets('http://127.0.0.1:1/presets.json');
+    expect(unreachable.source).toBe('local');
+    expect(unreachable.presets.length).toBe(catalog.length);
+
+    handler = () => new Response('nope', { status: 500 });
+    const errorStatus = await loadProviderPresets(serve());
+    expect(errorStatus.source).toBe('local');
+
+    handler = () => new Response('<html>not json</html>');
+    const garbage = await loadProviderPresets(serve());
+    expect(garbage.source).toBe('local');
+
+    handler = () => Response.json({ presets: [{ id: 'broken' }] });
+    const invalid = await loadProviderPresets(serve());
+    expect(invalid.source).toBe('local');
+    expect(invalid.presets.length).toBe(catalog.length);
+  });
+
+  test('invalid inline remote entry rejects the entire catalog and serves the local copy', async () => {
+    handler = () =>
+      Response.json({
+        presets: [
+          remoteEntry,
+          { ...inlineEntry, piAiQuirks: { chat: { api: 'openai-completions', typo: true } } },
+        ],
+      });
+    const result = await loadProviderPresets(serve());
+    expect(result.source).toBe('local');
+    expect(result.presets.some((entry) => entry.id === remoteEntry.id)).toBe(false);
+  });
+});
+
+describe('strict catalog validation', () => {
+  const validEntry = {
+    id: 'strict',
+    name: 'Strict',
+    suggestedProviderId: 'strict',
+    suggestedName: 'Strict',
+    apiBaseUrl: { chat: 'https://example.test/v1' },
+    piAiProvider: 'openai',
+    autoCompat: true,
+  };
+
+  test.each([
+    ['javascript: docsUrl', { ...validEntry, docsUrl: 'javascript:alert(1)' }],
+    ['non-http endpoint', { ...validEntry, apiBaseUrl: { chat: 'ftp://example.test/v1' } }],
+    [
+      'undeclared placeholder',
+      { ...validEntry, apiBaseUrl: { chat: 'https://{region}.example.test/v1' } },
+    ],
+    [
+      'prototype-shadowing templateVar key',
+      {
+        ...validEntry,
+        apiBaseUrl: { chat: 'https://example.test/{toString}/v1' },
+        templateVars: [{ key: 'toString', label: 'Bad' }],
+      },
+    ],
+    ['prototype-named experimental api', { ...validEntry, experimentalApis: ['toString'] }],
+    ['plain-http endpoint', { ...validEntry, apiBaseUrl: { chat: 'http://example.test/v1' } }],
+    ['plain-http docsUrl', { ...validEntry, docsUrl: 'http://example.test/docs' }],
+  ])('rejects %s', (_label, entry) => {
+    expect(ProviderPresetSchema.safeParse(entry).success).toBe(false);
+  });
+});
+
+describe('three quirk source modes', () => {
+  test('parses builtin, inline (including per-model overrides), and plain presets', () => {
+    const builtin = ProviderPresetSchema.parse(remoteEntry);
+    const inline = ProviderPresetSchema.parse(inlineEntry);
+    const plain = ProviderPresetSchema.parse(plainEntry);
+
+    expect(builtin.piAiProvider).toBe('openai');
+    expect(builtin.piAiQuirks).toBeUndefined();
+    expect(inline.piAiProvider).toBeUndefined();
+    expect(inline.piAiQuirks?.chat?.models?.['team/model-1']).toEqual({
+      thinkingLevelMap: { low: 'low' },
+      compat: { supportsTemperature: false },
+    });
+    expect(inline.piAiQuirks?.messages?.models?.['team/model-1']?.maxTokens).toBe(4096);
+    expect(inline.autoCompat).toBe(false);
+    expect(plain.piAiProvider).toBeUndefined();
+    expect(plain.piAiQuirks).toBeUndefined();
+    expect(plain.autoCompat).toBe(false);
+    for (const entry of [builtin, inline, plain]) {
+      expect(
+        validateEditorCatalog(editorCatalog(entry)),
+        JSON.stringify(validateEditorCatalog.errors)
+      ).toBe(true);
+    }
+  });
+
+  test('allows a model to opt out of target-wide reasoning without claiming a reasoning map', () => {
+    const entry = {
+      ...inlineEntry,
+      piAiQuirks: {
+        chat: {
+          api: 'openai-completions',
+          reasoning: true,
+          thinkingLevelMap: { high: 'high' },
+          models: { 'team/no-reasoning': { reasoning: false } },
+        },
+      },
+    };
+    expect(
+      ProviderPresetSchema.parse(entry).piAiQuirks?.chat?.models?.['team/no-reasoning']
+    ).toEqual({
+      reasoning: false,
+    });
+    expect(validateEditorCatalog(editorCatalog(entry))).toBe(true);
+  });
+
+  test('allows piAiProvider and piAiQuirks together as overlays', () => {
+    const entry = {
+      ...inlineEntry,
+      piAiProvider: 'openai',
+      piAiQuirks: {
+        chat: {
+          api: 'openai-completions',
+          compat: { serviceTierFormat: 'service-tier' },
+          serviceTierMap: { auto: 'auto', standard: 'default', priority: 'priority' },
+          models: { 'team/model-1': { serviceTierMap: { flex: 'flex' } } },
+        },
+      },
+    };
+    const parsed = ProviderPresetSchema.parse(entry);
+    expect(parsed.piAiProvider).toBe('openai');
+    expect(parsed.piAiQuirks?.chat?.serviceTierMap).toEqual({
+      auto: 'auto',
+      standard: 'default',
+      priority: 'priority',
+    });
+    expect(parsed.piAiQuirks?.chat?.compat?.serviceTierFormat).toBe('service-tier');
+    expect(parsed.piAiQuirks?.chat?.models?.['team/model-1']?.serviceTierMap).toEqual({
+      flex: 'flex',
+    });
+    expect(validateEditorCatalog(editorCatalog(entry))).toBe(true);
+  });
+
+  test('rejects an unknown service tier key or format', () => {
+    expect(
+      ProviderPresetSchema.safeParse({
+        ...inlineEntry,
+        piAiQuirks: { chat: { api: 'openai-completions', serviceTierMap: { turbo: 'x' } } },
+      }).success
+    ).toBe(false);
+    expect(
+      ProviderPresetSchema.safeParse({
+        ...inlineEntry,
+        piAiQuirks: {
+          chat: { api: 'openai-completions', compat: { serviceTierFormat: 'vertex-tier' } },
+        },
+      }).success
+    ).toBe(false);
+  });
+
+  test.each([
+    ['empty quirks', { ...inlineEntry, piAiQuirks: {} }],
+    [
+      'quirks on an unconfigured target',
+      { ...inlineEntry, piAiQuirks: { responses: { api: 'openai-responses' } } },
+    ],
+    ['auto-compat without a source', { ...plainEntry, autoCompat: true }],
+    ['empty endpoint map', { ...inlineEntry, apiBaseUrl: {} }],
+    [
+      'unsupported protocol',
+      { ...inlineEntry, piAiQuirks: { audio: { api: 'openai-completions' } } },
+    ],
+    ['mismatched dialect', { ...inlineEntry, piAiQuirks: { chat: { api: 'anthropic-messages' } } }],
+    [
+      'unknown target trait',
+      { ...inlineEntry, piAiQuirks: { chat: { api: 'openai-completions', maxToken: 4096 } } },
+    ],
+    [
+      'unknown model trait',
+      {
+        ...inlineEntry,
+        piAiQuirks: { chat: { api: 'openai-completions', models: { 'team/a': { maxToken: 42 } } } },
+      },
+    ],
+    [
+      'unknown compat flag',
+      {
+        ...inlineEntry,
+        piAiQuirks: { chat: { api: 'openai-completions', compat: { thinkingForma: 'zai' } } },
+      },
+    ],
+    [
+      'unsupported compat enum value',
+      {
+        ...inlineEntry,
+        piAiQuirks: { chat: { api: 'openai-completions', compat: { thinkingFormat: 'other' } } },
+      },
+    ],
+    [
+      'invalid maxTokens bound',
+      { ...inlineEntry, piAiQuirks: { chat: { api: 'openai-completions', maxTokens: -1 } } },
+    ],
+    [
+      'unsupported model reasoning override',
+      {
+        ...inlineEntry,
+        piAiQuirks: {
+          chat: {
+            api: 'openai-completions',
+            reasoning: true,
+            models: { 'team/a': { reasoning: false, thinkingLevelMap: { low: 'low' } } },
+          },
+        },
+      },
+    ],
+    [
+      'explicit target reasoning false with a thinking map',
+      {
+        ...inlineEntry,
+        piAiQuirks: {
+          chat: { api: 'openai-completions', reasoning: false, thinkingLevelMap: { high: 'high' } },
+        },
+      },
+    ],
+  ])('runtime and editor reject %s', (_label, entry) => {
+    expect(ProviderPresetSchema.safeParse(entry).success).toBe(false);
+    expect(
+      validateEditorCatalog(editorCatalog(entry)),
+      JSON.stringify(validateEditorCatalog.errors)
+    ).toBe(false);
+  });
+
+  test('allows a thinking map with omitted reasoning for builtin-model overlays', () => {
+    const quirks = {
+      chat: {
+        api: 'openai-completions',
+        models: { 'team/a': { thinkingLevelMap: { high: 'high' } } },
+      },
+    };
+    expect(PiAiQuirksSchema.safeParse(quirks).success).toBe(true);
+    expect(ProviderPresetSchema.safeParse({ ...inlineEntry, piAiQuirks: quirks }).success).toBe(
+      true
+    );
+    expect(validateEditorCatalog(editorCatalog({ ...inlineEntry, piAiQuirks: quirks }))).toBe(true);
+  });
+
+  test('runtime rejects a model-level thinking map that inherits reasoning: false', () => {
+    const quirks = {
+      chat: {
+        api: 'openai-completions',
+        reasoning: false,
+        models: { 'team/a': { thinkingLevelMap: { high: 'high' } } },
+      },
+    };
+    expect(PiAiQuirksSchema.safeParse(quirks).success).toBe(false);
+    expect(ProviderPresetSchema.safeParse({ ...inlineEntry, piAiQuirks: quirks }).success).toBe(
+      false
+    );
+  });
+
+  test('runtime catches placeholder references and duplicate IDs beyond editor validation', () => {
+    const badPlaceholder = {
+      ...remoteEntry,
+      apiBaseUrl: { chat: 'https://{region}.test/v1' },
+    };
+    expect(validateEditorCatalog(editorCatalog(badPlaceholder))).toBe(true);
+    expect(() => parseAndValidatePresets(editorCatalog(badPlaceholder), 'test')).toThrow(
+      /every \{placeholder\}/
+    );
+
+    const duplicates = { $schema: editorSchema.$id, presets: [remoteEntry, remoteEntry] };
+    expect(validateEditorCatalog(duplicates)).toBe(true);
+    expect(() => parseAndValidatePresets(duplicates, 'test')).toThrow(
+      /Duplicate provider preset id/
+    );
+  });
+});
+
+describe('findUnresolvedPresetVars', () => {
+  test('lists placeholders and ignores resolved URLs', () => {
+    expect(
+      findUnresolvedPresetVars({
+        chat: 'https://api.example.test/v1',
+        messages: 'https://api.example.test/{account_id}/v1',
+      })
+    ).toEqual(['account_id']);
+    expect(findUnresolvedPresetVars({ chat: 'https://api.example.test/v1' })).toEqual([]);
+  });
+});
+
+describe('substitutePresetVars', () => {
+  test('replaces known placeholders and leaves unknown ones visible', () => {
+    expect(
+      substitutePresetVars(
+        { chat: 'https://x.test/{account_id}/v1', other: 'https://y.test/{missing}/v1' },
+        { account_id: 'abc' }
+      )
+    ).toEqual({
+      chat: 'https://x.test/abc/v1',
+      other: 'https://y.test/{missing}/v1',
+    });
+  });
+
+  test('blank values do not substitute', () => {
+    expect(
+      substitutePresetVars({ chat: 'https://x.test/{account_id}/v1' }, { account_id: '  ' })
+    ).toEqual({ chat: 'https://x.test/{account_id}/v1' });
+  });
+});
+
+describe('applyProviderPreset', () => {
+  test('fills a blank draft with endpoints, types, and pi-ai mapping', () => {
+    const preset = presetOrThrow('moonshot');
+    const applied = applyProviderPreset(blankDraft(), preset);
+
+    expect(applied.id).toBe('moonshot');
+    expect(applied.name).toBe('Moonshot');
+    expect(applied.apiBaseUrl).toEqual<unknown>(preset.apiBaseUrl);
+    expect(applied.type).toEqual(['chat', 'responses', 'messages']);
+    expect(applied.pi_ai_provider).toBe('moonshotai');
+    expect(applied.auto_compat).toBe(true);
+  });
+
+  test('meta preset enables prompt_cache_key injection by default', () => {
+    const applied = applyProviderPreset(blankDraft(), presetOrThrow('meta'));
+    expect(applied.cacheKeyInjection).toBe('prompt_cache_key');
+  });
+
+  test('switches builtin → inline → plain without retaining a previous source', () => {
+    const builtin = ProviderPresetSchema.parse(remoteEntry);
+    const inline = ProviderPresetSchema.parse({ ...inlineEntry, autoCompat: true });
+    const plain = ProviderPresetSchema.parse(plainEntry);
+
+    const first = applyProviderPreset(blankDraft(), builtin);
+    const second = applyProviderPreset(first, inline, {}, builtin);
+    expect(second.pi_ai_provider).toBeUndefined();
+    expect(second.pi_ai_quirks).toEqual(inline.piAiQuirks);
+    expect(second.pi_ai_quirks).not.toBe(inline.piAiQuirks);
+    expect(second.pi_ai_quirks?.chat?.models?.['team/model-1']).not.toBe(
+      inline.piAiQuirks?.chat?.models?.['team/model-1']
+    );
+    expect(second.auto_compat).toBe(true);
+    expect(first.pi_ai_provider).toBe('openai');
+    expect(first.pi_ai_quirks).toBeUndefined();
+
+    const third = applyProviderPreset(second, plain, {}, inline);
+    expect(third.pi_ai_provider).toBeUndefined();
+    expect(third.pi_ai_quirks).toBeUndefined();
+    expect(third.auto_compat).toBe(false);
+    expect(third.id).toBe('plain');
+    expect(third.type).toEqual(['chat']);
+    const fourth = applyProviderPreset(third, builtin, {}, plain);
+    expect(fourth.pi_ai_provider).toBe('openai');
+    expect(fourth.pi_ai_quirks).toBeUndefined();
+    expect(fourth.auto_compat).toBe(true);
+  });
+
+  test('copies nested inline overrides so editing a draft cannot mutate its preset', () => {
+    const inline = ProviderPresetSchema.parse(inlineEntry);
+    const first = applyProviderPreset(blankDraft(), inline);
+    first.pi_ai_quirks!.chat!.models!['team/model-1']!.compat!.supportsTemperature = true;
+    const second = applyProviderPreset(blankDraft(), inline);
+    expect(second.pi_ai_quirks?.chat?.models?.['team/model-1']?.compat?.supportsTemperature).toBe(
+      false
+    );
+    expect(second.auto_compat).toBe(false);
+  });
+
+  test('never overwrites an existing id or name', () => {
+    const preset = presetOrThrow('openai');
+    const applied = applyProviderPreset({ ...blankDraft(), id: 'my-openai', name: 'Mine' }, preset);
+
+    expect(applied.id).toBe('my-openai');
+    expect(applied.name).toBe('Mine');
+    expect(applied.apiBaseUrl).toEqual<unknown>(preset.apiBaseUrl);
+  });
+
+  test('clears OAuth-mode leftovers since presets are API-key providers', () => {
+    const preset = presetOrThrow('groq');
+    const applied = applyProviderPreset(
+      { ...blankDraft(), apiBaseUrl: 'oauth://', apiKey: 'oauth', oauthProvider: 'meta' },
+      preset
+    );
+
+    expect(applied.apiBaseUrl).toEqual<unknown>(preset.apiBaseUrl);
+    expect(applied.apiKey).toBe('');
+    expect(applied.oauthProvider).toBe('');
+  });
+
+  test('preserves a typed API key', () => {
+    const preset = presetOrThrow('groq');
+    const applied = applyProviderPreset({ ...blankDraft(), apiKey: 'sk-live' }, preset);
+
+    expect(applied.apiKey).toBe('sk-live');
+  });
+
+  test('substitutes template vars into the endpoint map', () => {
+    const preset = presetOrThrow('cloudflare');
+    const applied = applyProviderPreset(blankDraft(), preset, { account_id: 'acct123' });
+
+    expect(applied.apiBaseUrl).toEqual({
+      chat: 'https://api.cloudflare.com/client/v4/accounts/acct123/ai/v1',
+      messages: 'https://api.cloudflare.com/client/v4/accounts/acct123/ai/v1',
+      responses: 'https://api.cloudflare.com/client/v4/accounts/acct123/ai/v1',
+    });
+  });
+
+  test('switching presets overwrites fields still holding the previous suggestion', () => {
+    const openai = presetOrThrow('openai');
+    const moonshot = presetOrThrow('moonshot');
+    const first = applyProviderPreset(blankDraft(), openai);
+    expect(first.id).toBe('openai');
+
+    const second = applyProviderPreset(first, moonshot, {}, openai);
+    expect(second.id).toBe('moonshot');
+    expect(second.name).toBe('Moonshot');
+    expect(second.apiBaseUrl).toEqual(moonshot.apiBaseUrl);
+  });
+
+  test('switching presets preserves operator-typed id and name', () => {
+    const openai = presetOrThrow('openai');
+    const moonshot = presetOrThrow('moonshot');
+    const first = applyProviderPreset({ ...blankDraft(), id: 'mine', name: 'Mine' }, openai);
+    const second = applyProviderPreset(first, moonshot, {}, openai);
+    expect(second.id).toBe('mine');
+    expect(second.name).toBe('Mine');
+  });
+
+  test('does not mutate the draft or the preset', () => {
+    const preset = presetOrThrow('zai');
+    const draft = blankDraft();
+    const draftSnapshot = structuredClone(draft);
+    const presetSnapshot = structuredClone(preset);
+
+    applyProviderPreset(draft, preset);
+
+    expect(draft).toEqual(draftSnapshot);
+    expect(preset).toEqual(presetSnapshot);
+  });
+});
+
+describe('applyProviderPreset on an existing provider (preserveIdentity)', () => {
+  test('keeps id and name across preset switches even when they match a suggestion', () => {
+    const openai = presetOrThrow('openai');
+    const moonshot = presetOrThrow('moonshot');
+    // The edit draft's id/name happen to equal openai's suggested identity,
+    // which a plain apply would treat as auto-filled on the next switch.
+    const existing = { ...blankDraft(), id: 'openai', name: 'OpenAI Production' };
+
+    const first = applyProviderPreset(existing, openai, {}, undefined, { preserveIdentity: true });
+    expect(first.id).toBe('openai');
+    expect(first.name).toBe('OpenAI Production');
+
+    const second = applyProviderPreset(first, moonshot, {}, openai, { preserveIdentity: true });
+    expect(second.id).toBe('openai');
+    expect(second.name).toBe('OpenAI Production');
+    expect(second.apiBaseUrl).toEqual(moonshot.apiBaseUrl);
+    expect(second.type).toEqual(Object.keys(moonshot.apiBaseUrl));
+  });
+
+  test('preserves API key, models, and unrelated settings while replacing preset fields', () => {
+    const meta = presetOrThrow('meta');
+    const draft: ProviderPresetDraft & {
+      models: Record<string, unknown>;
+      enabled: boolean;
+      headers: Record<string, string>;
+      timeoutMs: number;
+    } = {
+      ...blankDraft(),
+      id: 'my-meta',
+      name: 'My Meta',
+      apiKey: 'sk-live',
+      models: { 'meta/llama-4': { access_via: ['chat'] } },
+      enabled: false,
+      headers: { 'x-custom': 'yes' },
+      timeoutMs: 1234,
+      apiBaseUrl: { chat: 'https://old.example.test' },
+      type: ['chat'],
+      pi_ai_provider: 'stale',
+      auto_compat: true,
+      cacheKeyInjection: 'session_id',
+      responsesExtensions: ['custom_tools'],
+    };
+
+    const applied = applyProviderPreset(draft, meta, {}, undefined, { preserveIdentity: true });
+
+    // Identity and unrelated config survive.
+    expect(applied.id).toBe('my-meta');
+    expect(applied.name).toBe('My Meta');
+    expect(applied.apiKey).toBe('sk-live');
+    expect(applied.models).toEqual({ 'meta/llama-4': { access_via: ['chat'] } });
+    expect(applied.enabled).toBe(false);
+    expect(applied.headers).toEqual({ 'x-custom': 'yes' });
+    expect(applied.timeoutMs).toBe(1234);
+
+    // Preset-controlled fields are replaced.
+    expect(applied.apiBaseUrl).toEqual(meta.apiBaseUrl);
+    expect(applied.type).toEqual(Object.keys(meta.apiBaseUrl));
+    expect(applied.pi_ai_provider).toBe('meta');
+    expect(applied.auto_compat).toBe(true);
+    expect(applied.cacheKeyInjection).toBe('prompt_cache_key');
+    expect(applied.responsesExtensions).toBeUndefined();
+  });
+});
