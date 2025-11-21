@@ -1,0 +1,189 @@
+parameters:
+  - in: path
+    name: name
+    required: true
+    schema:
+      type: string
+    description: API key name (e.g. "sk-prod", "sk-dev").
+get:
+  tags:
+    - Management — Config
+  summary: Get an API key by name (admin only)
+  description: |
+    Returns a single API key record by name.
+
+    The stored secret is returned decrypted by the HTTP management API.
+    Clients that need redaction should apply it themselves or use the MCP
+    management surface instead.
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+  responses:
+    '200':
+      description: API key configuration.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - type: object
+                properties:
+                  name:
+                    type: string
+              - $ref: ../components/schemas/KeyConfig.yaml
+    '404':
+      description: API key not found.
+  operationId: getV0ManagementKeysByname
+put:
+  tags:
+    - Management — Config
+  summary: Create or replace an API key (admin only)
+  description: |
+    Creates a new API key or replaces an existing one.
+
+    ## Required fields
+
+    - `secret` — The API key secret (e.g. `sk-...`). This is encrypted
+      at rest in the database.
+
+    ## Optional fields
+
+    - `comment` — Freeform description (max 500 chars)
+    - `allowedProviders` — Array of provider slugs to restrict this key to
+    - `allowedModels` — Array of model aliases to restrict this key to
+    - `allowRawPassthrough` — Privileged provider-wide raw proxy capability
+    - `quota` — Name of a user quota definition to assign
+    - `expiresInMinutes` — Positive whole-minute lifetime for a new key. This
+      becomes immutable after creation.
+
+    ## Secret encryption
+
+    The secret is encrypted using the `ENCRYPTION_KEY` environment variable
+    before storage. Keys are decrypted only when needed for authentication.
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          $ref: ../components/schemas/KeyConfig.yaml
+        examples:
+          production_key:
+            summary: Production API key
+            value:
+              secret: sk-prod-xxxxx
+              comment: Production API key for web app
+              allowedProviders:
+                - openai
+                - anthropic
+              quota: premium_daily
+          development_key:
+            summary: Development API key
+            value:
+              secret: sk-dev-xxxxx
+              comment: Development/testing key
+              allowedModels:
+                - fast-model
+                - cheap-model
+  responses:
+    '200':
+      description: Saved.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success:
+                type: boolean
+                const: true
+              name:
+                type: string
+    '401':
+      description: Authentication required or invalid credentials.
+  operationId: putV0ManagementKeysByname
+patch:
+  tags:
+    - Management — Config
+  summary: Merge updates into an API key (admin only)
+  description: |
+    Merges the request body into the existing API key configuration, then
+    validates the result against `KeyConfig`.
+
+    PATCH performs a shallow merge; fields omitted from the request keep their
+    existing values.
+
+    ## Deep merge (`?merge=deep`)
+
+    Nested objects merge key by key and a `null` value removes a field. The
+    list fields (`quotas`, `allowedModels`, `allowedProviders`, …) are arrays
+    and always replace. The ModelMux management MCP tools always request this mode
+    for `update`.
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+  parameters:
+    - in: query
+      name: merge
+      schema:
+        type: string
+        enum:
+          - deep
+          - 'true'
+      description: >
+        `deep` merges nested objects key by key instead of replacing them, and
+        treats `null` as a removal. Omit for the default shallow merge.
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          type: object
+          additionalProperties: true
+  responses:
+    '200':
+      description: Saved.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success:
+                type: boolean
+                const: true
+              name:
+                type: string
+    '400':
+      description: Validation failed.
+    '404':
+      description: API key not found.
+  operationId: patchV0ManagementKeysByname
+delete:
+  tags:
+    - Management — Config
+  summary: Delete an API key (admin only)
+  description: |
+    Permanently removes an API key.
+
+    ## Impact
+
+    All requests using this key will immediately fail with 401. Usage
+    history for this key is preserved (attached to the key name), but
+    new requests are impossible until the key is recreated.
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+  responses:
+    '200':
+      description: Deleted.
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/SuccessTrue.yaml
+    '401':
+      description: Authentication required or invalid credentials.
+  operationId: deleteV0ManagementKeysByname
