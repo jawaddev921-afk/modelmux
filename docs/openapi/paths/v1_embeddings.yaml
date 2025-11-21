@@ -1,0 +1,35 @@
+post:
+  tags:
+    - Inference — Embeddings
+  summary: OpenAI-compatible embeddings with provider-aware transformation
+  description: |
+    Requires a model configured with `type: embeddings`. Accepts requests in
+    OpenAI embeddings format. For OpenAI-compatible providers, requests and
+    responses are forwarded directly. For Gemini providers, ModelMux transforms
+    the request to the Gemini `embedContent`/`batchEmbedContents` format and
+    normalises the response back to OpenAI format.
+
+    Supported provider types: `openai`, `chat` (pass-through), `gemini`
+    (transformed).
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          $ref: ../components/schemas/EmbeddingsRequest.yaml
+        examples:
+          basic:
+            value:
+              model: text-embedding-3-small
+              input:
+                - Hello world
+  responses:
+    '200':
+      description: Embeddings response.
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/EmbeddingsResponse.yaml
+    '401':
+      description: Authentication required or invalid credentials.
+  operationId: postV1Embeddings
