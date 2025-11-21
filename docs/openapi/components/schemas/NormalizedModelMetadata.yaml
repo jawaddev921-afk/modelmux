@@ -1,0 +1,38 @@
+type: object
+description: >-
+  Full normalized metadata from an external catalog (OpenRouter, models.dev,
+  catwalk). Used by the admin UI to pre-fill override forms.
+additionalProperties: true
+properties:
+  name:
+    type: string
+    description: Display name from the source catalog.
+  description:
+    type: string
+    description: Model description.
+  context_length:
+    type: integer
+    description: Maximum context window in tokens.
+  architecture:
+    type: object
+    additionalProperties: true
+    description: >-
+      Modalities and tokenizer information.
+      - `input_modalities`: supported input types (text, image, etc.)
+      - `output_modalities`: supported output types
+      - `tokenizer`: tokenizer family
+  pricing:
+    type: object
+    additionalProperties: true
+    description: >-
+      Per-token pricing (prompt, completion, cache hits), including optional
+      context-length tiers in `tiers` when the source catalog provides them.
+  supported_parameters:
+    type: array
+    items:
+      type: string
+    description: Parameters the model supports (temperature, tools, etc.).
+  top_provider:
+    type: object
+    additionalProperties: true
+    description: Details of the primary upstream provider.

@@ -1,0 +1,74 @@
+get:
+  tags:
+    - Inference — Models
+  summary: List configured aliases (public)
+  description: |
+    Returns all configured model aliases. If an alias has a `metadata`
+    block, the response includes enriched OpenRouter-style fields. When
+    available, `pricing.tiers` lists context-length pricing bands; aliases can
+    also define these under `metadata.overrides.pricing.tiers`.
+
+    This endpoint computes a SHA-256 hash of the fully serialized JSON
+    response to provide `ETag` and `Last-Modified` headers. Computing the
+    hash on the fly is explicitly accepted as benchmarks show it is
+    extremely fast (<0.01ms). It supports `If-None-Match` and
+    `If-Modified-Since` headers to return a 304 Not Modified status.
+  security: []
+  responses:
+    '200':
+      description: Alias list.
+      headers:
+        ETag:
+          schema:
+            type: string
+          description: A SHA-256 hash of the JSON response payload.
+        Last-Modified:
+          schema:
+            type: string
+          description: The date when the response hash last changed.
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/ModelList.yaml
+          example:
+            object: list
+            data:
+              - id: fast-model
+                object: model
+                created: 1748000000
+                owned_by: modelmux
+                name: 'OpenAI: GPT-4.1 Nano'
+                description: GPT-4.1 Nano is a lightweight model for fast tasks.
+                context_length: 1000000
+                architecture:
+                  input_modalities:
+                    - text
+                    - image
+                  output_modalities:
+                    - text
+                  tokenizer: GPT
+                pricing:
+                  prompt: '0.0000001'
+                  completion: '0.0000004'
+                  input_cache_read: '0.000000025'
+                  tiers:
+                    - input_tokens_above: 272000
+                      prompt: '0.0000002'
+                      completion: '0.0000008'
+                supported_parameters:
+                  - temperature
+                  - tools
+                  - tool_choice
+                  - max_tokens
+                top_provider:
+                  context_length: 1000000
+                  max_completion_tokens: 32768
+              - id: plain-model
+                object: model
+                created: 1748000000
+                owned_by: modelmux
+    '304':
+      description: Not Modified. The client's cached version is still current based on ETag or Last-Modified.
+    '400':
+      description: Bad request.
+  operationId: getV1Models

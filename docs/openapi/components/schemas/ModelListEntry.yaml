@@ -1,0 +1,126 @@
+type: object
+description: >
+  Model alias entry. If the alias has a `metadata` block, includes enriched
+  OpenRouter-style fields.
+required:
+  - id
+  - object
+  - created
+  - owned_by
+properties:
+  id:
+    type: string
+    description: Alias identifier (slug).
+  object:
+    type: string
+    const: model
+    description: Fixed value indicating a model.
+  created:
+    type: integer
+    description: Creation timestamp in epoch seconds.
+  owned_by:
+    type: string
+    const: modelmux
+    description: Fixed value indicating ModelMux-managed.
+  type:
+    type: string
+    enum: [text, embeddings, transcriptions, speech, image, decisions]
+    description: >
+      Alias capability type — what the model produces. Defaults to `text`
+      when the alias has no explicit `type`.
+  name:
+    type: string
+    description: >
+      Display name (e.g. "OpenAI: GPT-4.1 Nano").
+  short_name:
+    type: string
+    description: >
+      Compact display label (e.g. "Sonnet 5.5"). Explicitly configured
+      via the alias `metadata.overrides.short_name`, otherwise
+      deterministically derived from `name`.
+  description:
+    type: string
+    description: Model description from metadata.
+  context_length:
+    type: integer
+    description: Maximum context window size in tokens.
+  architecture:
+    type: object
+    additionalProperties: true
+    description: >
+      Model architecture details including:
+      - input_modalities: array of supported input types (text, image, audio)
+      - output_modalities: array of supported output types
+      - tokenizer: tokenizer family name
+  pricing:
+    type: object
+    additionalProperties: true
+    description: >
+      Pricing in dollars per token, represented as decimal strings.
+    properties:
+      prompt:
+        type: string
+        description: Input price per token.
+      completion:
+        type: string
+        description: Output price per token.
+      input_cache_read:
+        type: string
+        description: Cache hit price per token, as a decimal string.
+      input_cache_write:
+        type: string
+        description: Cache write price per token, as a decimal string.
+      tiers:
+        type: array
+        description: Context-length pricing bands, when the source catalog or alias defines them.
+        items:
+          type: object
+          required: [input_tokens_above]
+          properties:
+            input_tokens_above:
+              type: integer
+              minimum: 0
+              description: Apply this band when input tokens exceed this threshold.
+            prompt:
+              type: string
+              description: Input price per token for this band.
+            completion:
+              type: string
+              description: Output price per token for this band.
+            input_cache_read:
+              type: string
+              description: Cached input read price per token for this band.
+            input_cache_write:
+              type: string
+              description: Cached input write price per token for this band.
+  service_tiers:
+    type: array
+    uniqueItems: true
+    items:
+      type: string
+      enum: [auto, standard, flex, priority, ultrafast]
+    description: >
+      Union of native service tiers declared per model by enabled alias
+      targets, including nested aliases. Provider-wide tier maps are not
+      advertised. Uses canonical ModelMux names in
+      the order auto, standard, flex, priority, ultrafast. Support on one
+      target is sufficient; another target may rewrite or downgrade the tier.
+      Unknown capabilities contribute nothing. Omitted when no target has
+      known, projectable capabilities; an empty array means the known maps
+      declare no native tiers. Does not include tier pricing.
+  supported_parameters:
+    type: array
+    items:
+      type: string
+    description: List of supported request parameters (e.g. temperature, tools, max_tokens).
+  top_provider:
+    type: object
+    additionalProperties: true
+    description: Primary provider details.
+    properties:
+      context_length:
+        type: integer
+        description: Provider's context length limit.
+      max_completion_tokens:
+        type: integer
+        description: Maximum output tokens supported.
