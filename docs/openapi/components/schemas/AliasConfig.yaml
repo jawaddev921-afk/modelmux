@@ -1,0 +1,391 @@
+type: object
+required:
+  - target_groups
+description: >
+  Model alias configuration. Maps a client-facing model name to one or
+  more provider targets, organised into ordered target groups.
+  Stored in the database.
+properties:
+  target_groups:
+    type: array
+    minItems: 1
+    items:
+      type: object
+      required:
+        - name
+        - selector
+        - targets
+      properties:
+        name:
+          type: string
+          description: Group label (e.g. "subscription", "payg", "backup").
+        selector:
+          type: string
+          enum:
+            - random
+            - in_order
+            - cost
+            - latency
+            - usage
+            - quota
+            - performance
+            - e2e_performance
+          description: Selection strategy for this group.
+        targets:
+          type: array
+          items:
+            type: object
+            required:
+              - provider
+              - model
+            properties:
+              provider:
+                type: string
+                description: Provider slug this target routes to.
+              model:
+                type: string
+                description: Model ID to request from the provider.
+              enabled:
+                type: boolean
+                default: true
+                description: When false, this target is skipped during dispatch.
+    description: >
+      Ordered list of target groups. The dispatcher exhausts all healthy
+      targets in group N before trying group N+1. At least one group is
+      required.
+  type:
+    type: string
+    enum:
+      - text
+      - embeddings
+      - transcriptions
+      - speech
+      - image
+    description: >
+      Model capability type — what the model produces. This is distinct from
+      the wire protocol (which is configured via `preferred_api` or
+      `access_via` on each provider model).
+
+      - **text** — Text generation (LLM). Supports all text wire protocols:
+        chat completions, messages, gemini, responses, ollama.
+      - **embeddings** — Vector embeddings, including Gemini backends via
+        automatic request/response transformation.
+      - **transcriptions** — Audio to text.
+      - **speech** — Text to audio.
+      - **image** — Image generation/editing.
+  priority:
+    type: string
+    enum:
+      - selector
+      - api_match
+    default: selector
+    description: >
+      Controls how selectors interact with API-type matching.
+
+      - **selector** — Apply each group's selector across its targets regardless of API type.
+      - **api_match** — Filter targets to those whose provider supports the
+        requested API type first, then apply the selector.
+  preferred_api:
+    type: array
+    description: >
+      Advertised in /v1/models to inform clients of the recommended API
+      surface for this alias. For text aliases, when omitted, ModelMux infers
+      `messages` for Anthropic/Claude models, `responses` for GPT models,
+      `gemini` for Gemini models, and `chat_completions` for everything else.
+      Non-text aliases do not receive an inferred value.
+    items:
+      type: string
+      enum:
+        - chat_completions
+        - messages
+        - gemini
+        - responses
+  additional_aliases:
+    type: array
+    items:
+      type: string
+    description: >
+      Additional names this alias is known by. Requests using any of these
+      names are routed identically to the primary slug.
+  use_image_fallthrough:
+    type: boolean
+    default: false
+    description: >
+      When true, vision requests that fail image processing fall through to
+      text-only handling rather than returning an error.
+  enforce_limits:
+    type: boolean
+    default: false
+    description: >
+      When true, enforces the model's `max_tokens` / `max_output_tokens`
+      constraint from metadata, rejecting requests that exceed it.
+  extraBody:
+    type: object
+    additionalProperties: true
+    description: >
+      Extra JSON body fields merged into every request dispatched through
+      this alias. Merged after provider-level and model-level extraBody,
+      so alias values win.
+  sticky_session:
+    type: boolean
+    default: false
+    description: >
+      When enabled, multi-turn conversations prefer the same provider/model
+      from the previous turn (when still healthy) for better prompt-cache
+      hit rates.
+  synthetic_safeguard_approval:
+    type: boolean
+    default: false
+    description: >
+      When enabled, translated (non-native Messages) responses for this alias
+      carry synthetic safeguard_results (evaluated/not_flagged with an
+      explanatory note) when the inbound Messages request asked via
+      safeguards. Opt-in: no real classifier runs.
+  metadata:
+    description: >
+      Model metadata strategy. When omitted or set to `auto`, ModelMux derives a
+      canonical identity from the alias targets, looks for an exact catalog
+      entry, and falls back to conservative name and modality heuristics.
+      Catalog sources pin a specific entry, `custom` supplies all fields, and
+      `disabled` suppresses enrichment. Overrides win over resolved values.
+    oneOf:
+      - type: object
+        required:
+          - source
+        properties:
+          source:
+            type: string
+            enum: [auto]
+          overrides:
+            $ref: ./MetadataOverrides.yaml
+        additionalProperties: false
+      - type: object
+        required:
+          - source
+        properties:
+          source:
+            type: string
+            enum: [disabled]
+        additionalProperties: false
+      - type: object
+        required:
+          - source
+          - source_path
+        properties:
+          source:
+            type: string
+            enum: [openrouter]
+          source_path:
+            type: string
+            description: >
+              Path within the OpenRouter catalog (e.g. `openai/gpt-4.1-nano`).
+          overrides:
+            $ref: ./MetadataOverrides.yaml
+        additionalProperties: false
+      - type: object
+        required:
+          - source
+          - source_path
+        properties:
+          source:
+            type: string
+            enum: [models.dev]
+          source_path:
+            type: string
+            description: >
+              Path within the models.dev catalog (e.g.
+              `anthropic.claude-3-5-haiku-20241022`).
+          overrides:
+            $ref: ./MetadataOverrides.yaml
+        additionalProperties: false
+      - type: object
+        required:
+          - source
+          - source_path
+        properties:
+          source:
+            type: string
+            enum: [catwalk]
+          source_path:
+            type: string
+            description: >
+              Path within the catwalk catalog.
+          overrides:
+            $ref: ./MetadataOverrides.yaml
+        additionalProperties: false
+      - type: object
+        required:
+          - source
+          - overrides
+        properties:
+          source:
+            type: string
+            enum: [custom]
+          source_path:
+            type: string
+            description: >
+              Optional label. Not used for any catalog lookup.
+          overrides:
+            type: object
+            required:
+              - name
+            description: >
+              All metadata lives here for custom sources. `name` is required
+              because there is no catalog fallback.
+            allOf:
+              - $ref: ./MetadataOverrides.yaml
+        additionalProperties: false
+    discriminator:
+      propertyName: source
+  input_price_per_million:
+    type: number
+    description: >
+      Shorthand simple pricing: input price per million tokens. Equivalent
+      to setting `pricing` to `{ source: "simple", input: <value>, output: <output_price_per_million> }`.
+      Only used when `pricing` is not set.
+  output_price_per_million:
+    type: number
+    description: >
+      Shorthand simple pricing: output price per million tokens. See
+      `input_price_per_million`.
+  pi_model:
+    type: object
+    description: >
+      Link to a pi-ai model to include its compatibility options as
+      `pi_options` in `GET /v1/models`.
+    properties:
+      provider:
+        type: string
+        description: pi-ai provider identifier (e.g. openai, anthropic).
+      model_id:
+        type: string
+        description: pi-ai model ID (e.g. gpt-4o, claude-sonnet-4-20250514).
+    required:
+      - provider
+      - model_id
+  pricing:
+    description: >
+      Advanced pricing configuration. Takes precedence over
+      `input_price_per_million` / `output_price_per_million` when set.
+    oneOf:
+      - type: object
+        required: [source, slug]
+        properties:
+          source:
+            type: string
+            enum: [openrouter]
+          slug:
+            type: string
+            description: OpenRouter model slug to pull live pricing from.
+          discount:
+            type: number
+            minimum: 0
+            maximum: 1
+      - type: object
+        required: [source, range]
+        properties:
+          source:
+            type: string
+            enum: [defined]
+          range:
+            type: array
+            minItems: 1
+            items:
+              type: object
+              required: [input_per_m, output_per_m]
+              properties:
+                lower_bound:
+                  type: number
+                  minimum: 0
+                  default: 0
+                upper_bound:
+                  type: number
+                  default: .inf
+                input_per_m:
+                  type: number
+                  minimum: 0
+                output_per_m:
+                  type: number
+                  minimum: 0
+                cached_per_m:
+                  type: number
+                  minimum: 0
+                cache_write_per_m:
+                  type: number
+                  minimum: 0
+      - type: object
+        required: [source, input, output]
+        properties:
+          source:
+            type: string
+            enum: [simple]
+          input:
+            type: number
+            minimum: 0
+          output:
+            type: number
+            minimum: 0
+          cached:
+            type: number
+            minimum: 0
+          cache_write:
+            type: number
+            minimum: 0
+      - type: object
+        required: [source, amount]
+        properties:
+          source:
+            type: string
+            enum: [per_request]
+          amount:
+            type: number
+            minimum: 0
+            description: Flat fee charged per request regardless of token count.
+  advanced:
+    type: array
+    description: >
+      List of model behaviour modifiers applied during request/response
+      transformation. `inject_cache_control` is also applied implicitly for
+      aliases that dispatch to Anthropic's own API; configuring it explicitly
+      (including `enabled: false` to opt out) overrides that default.
+    items:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum:
+            - strip_adaptive_thinking
+            - inject_cache_control
+          description: Behaviour modifier type.
+        enabled:
+          type: boolean
+          default: true
+        tools:
+          type: boolean
+          default: true
+          description: >
+            `inject_cache_control` only. Mark the last tool definition so the
+            tools block is cached.
+        system:
+          type: boolean
+          default: true
+          description: >
+            `inject_cache_control` only. Mark the last system text block.
+        message_breakpoints:
+          type: integer
+          minimum: 0
+          maximum: 4
+          default: 2
+          description: >
+            `inject_cache_control` only. Number of trailing ("walking")
+            breakpoints placed on the conversation tail. 0 keeps breakpoints on
+            the static prefix only.
+        ttl:
+          type: string
+          enum: ['5m', '1h']
+          description: >
+            `inject_cache_control` only. Cache TTL; omitted leaves Anthropic's
+            5m default (1.25x write). `1h` doubles the cache-write cost and also
+            extends the sticky-session window for the alias.

@@ -1,0 +1,182 @@
+parameters:
+  - in: path
+    name: slug
+    required: true
+    schema:
+      type: string
+    description: Alias slug (e.g. "gpt-4", "claude-3-opus").
+get:
+  tags:
+    - Management — Config
+  summary: Get a model alias by slug (admin only)
+  description: |
+    Returns a single model alias configuration by slug.
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+  responses:
+    '200':
+      description: Alias configuration.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - type: object
+                properties:
+                  slug:
+                    type: string
+              - $ref: ../components/schemas/AliasConfig.yaml
+    '404':
+      description: Alias not found.
+  operationId: getV0ManagementAliasesByslug
+put:
+  tags:
+    - Management — Config
+  summary: Create or replace a model alias (admin only)
+  description: |
+    Creates a new alias or replaces an existing one.
+
+    ## Validation
+
+    The request body is validated against the `AliasConfig` schema.
+    Invalid configurations return a 400 with validation error details.
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          $ref: ../components/schemas/AliasConfig.yaml
+        examples:
+          chat_alias:
+            summary: Text model alias (with custom metadata)
+            value:
+              type: text
+              target_groups:
+                - name: default
+                  selector: random
+                  targets:
+                    - provider: openai
+                      model: gpt-4o
+              input_price_per_million: 2.5
+              output_price_per_million: 10
+              metadata:
+                source: custom
+                overrides:
+                  name: GPT-4o
+                  description: OpenAI GPT-4o flagship model
+                  context_length: 128000
+          chat_alias_multi_group:
+            summary: Alias with multiple target groups
+            value:
+              type: text
+              target_groups:
+                - name: subscription
+                  selector: e2e_performance
+                  targets:
+                    - provider: neuralwatt
+                      model: zai-org/GLM-5.1-FP8
+                    - provider: zenmux-sub
+                      model: z-ai/glm-5.1
+                - name: payg
+                  selector: cost
+                  targets:
+                    - provider: kilocode
+                      model: z-ai/glm-5.1
+                - name: backup
+                  selector: in_order
+                  targets:
+                    - provider: wisgate
+                      model: glm-5.1
+          chat_alias_openrouter:
+            summary: Text model alias (OpenRouter catalog metadata)
+            value:
+              type: text
+              target_groups:
+                - name: default
+                  selector: random
+                  targets:
+                    - provider: openrouter
+                      model: openai/gpt-4o
+              metadata:
+                source: openrouter
+                source_path: openai/gpt-4o
+          embeddings_alias:
+            summary: Embeddings model alias
+            value:
+              type: embeddings
+              target_groups:
+                - name: default
+                  selector: random
+                  targets:
+                    - provider: openai
+                      model: text-embedding-3-small
+              input_price_per_million: 0.02
+              output_price_per_million: 0
+  responses:
+    '200':
+      description: Saved.
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/SaveSlugResult.yaml
+    '400':
+      $ref: ../components/responses/ValidationError.yaml
+  operationId: putV0ManagementAliasesByslug
+patch:
+  tags:
+    - Management — Config
+  summary: Merge updates into a model alias (admin only)
+  description: |
+    Merges the request body into the existing alias configuration,
+    then validates the result.
+
+    ## Merge behavior
+
+    PATCH performs a shallow merge — new fields are added, existing fields
+    are overwritten, fields not in the request are preserved.
+
+    ## Deep merge (`?merge=deep`)
+
+    Nested objects merge key by key and a `null` value removes a field. Targets,
+    target groups, and the other list fields are arrays and always replace, so
+    send the complete list when changing one. The ModelMux management MCP tools
+    always request this mode for `update`.
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+  parameters:
+    - in: query
+      name: merge
+      schema:
+        type: string
+        enum:
+          - deep
+          - 'true'
+      description: >
+        `deep` merges nested objects key by key instead of replacing them, and
+        treats `null` as a removal. Omit for the default shallow merge.
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          type: object
+          additionalProperties: true
+  responses:
+    '200':
+      description: Saved.
+      content:
+        application/json:
+          schema:
+            $ref: ../components/schemas/SaveSlugResult.yaml
+    '400':
+      $ref: ../components/responses/ValidationError.yaml
+    '404':
+      description: Alias not found.
+  operationId: patchV0ManagementAliasesByslug
