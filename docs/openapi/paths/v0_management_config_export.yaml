@@ -1,0 +1,29 @@
+get:
+  tags:
+    - Management — Config
+  summary: Export the configuration as JSON (admin only)
+  description: |
+    Exports the persisted configuration graph as JSON.
+
+    ## JSON endpoints
+
+    - **`GET /v0/management/config`** — Returns configuration as JSON
+    - **This endpoint** — Returns an export-friendly JSON object
+
+    This endpoint is useful for programmatic export/backup flows. It does not
+    return YAML and ModelMux no longer relies on an on-disk YAML source of truth.
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+  responses:
+    '200':
+      description: JSON export.
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+    '401':
+      description: Authentication required or invalid credentials.
+  operationId: getV0ManagementConfigExport

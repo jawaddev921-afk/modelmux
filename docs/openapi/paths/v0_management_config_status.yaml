@@ -1,0 +1,32 @@
+get:
+  tags:
+    - Management — Config
+  summary: Get configuration resource counts (admin only)
+  description: |
+    Returns counts for the database-backed configuration resources.
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+  responses:
+    '200':
+      description: Configuration resource counts.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              providerCount:
+                type: integer
+              modelAliasCount:
+                type: integer
+              keyCount:
+                type: integer
+              quotaCount:
+                type: integer
+              mcpServerCount:
+                type: integer
+            required: [providerCount, modelAliasCount, keyCount, quotaCount, mcpServerCount]
+    '401':
+      description: Authentication required or invalid credentials.
+  operationId: getV0ManagementConfigStatus
