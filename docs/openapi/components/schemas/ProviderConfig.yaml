@@ -1,0 +1,418 @@
+type: object
+description: >
+  Provider configuration. Used to define upstream LLM providers that ModelMux
+  can route requests to. Stored in the database.
+  `providers` section.
+required:
+  - api_base_url
+properties:
+  display_name:
+    type: string
+    description: >
+      Optional human-readable label for this provider shown in the admin UI.
+  api_base_url:
+    oneOf:
+      - type: string
+        format: uri
+        description: >
+          Base URL for all requests to this provider (e.g.
+          `https://api.openai.com/v1`). May also be an `oauth://` URI for
+          OAuth-authenticated providers.
+      - type: object
+        additionalProperties:
+          type: string
+        description: >
+          Map of inference-type → URL when a single provider exposes multiple
+          API surfaces at different endpoints. Keys are the inference type
+          strings (`chat`, `embeddings`, etc.).
+    description: >
+      Provider base URL. Either a single URL string or a map of
+      inference-type → URL for providers with multiple surfaces. Accepts
+      `oauth://` URIs for OAuth-authenticated providers.
+  api_key:
+    type: string
+    description: >
+      API key for the provider. Can be a literal string or
+      `$env:VARIABLE_NAME` to reference an environment variable. Required
+      unless `api_base_url` is an `oauth://` URI.
+  oauth_provider:
+    type: string
+    description: >
+      OAuth provider identifier. Required when `api_base_url` uses an
+      `oauth://` URI. Determines which OAuth flow is used to obtain
+      credentials. Any OAuth-capable provider bundled with ModelMux's pi-ai
+      dependency is accepted (e.g. `anthropic`, `openai-codex`,
+      `github-copilot`, `xai`, `kimi-coding`, `openrouter`) except `radius`,
+      which is not supported. See `GET /v0/management/oauth/providers` for
+      the current list. `google-gemini-cli` and `google-antigravity` are
+      deprecated and no longer supported — they are rejected on write.
+  oauth_account:
+    type: string
+    description: >
+      OAuth account identifier. Derived from the provider ID (one login per
+      provider) and never set by users; accepted on write only as a
+      grandfathered fallback for restores/imports that predate slug keying.
+  enabled:
+    type: boolean
+    default: true
+    description: >
+      When false, this provider is excluded from all routing decisions.
+  raw_passthrough:
+    type: object
+    description: >
+      Enables a provider-wide raw proxy at `/raw/{provider}/*`. Supported only
+      for static API-key providers. Raw requests bypass routing, failover,
+      adapters, and transformation.
+    required:
+      - enabled
+      - base_url
+    properties:
+      enabled:
+        type: boolean
+      base_url:
+        type: string
+        format: uri
+        description: HTTP(S) base URL prepended to the untouched raw path suffix.
+      auth:
+        type: string
+        enum:
+          - bearer
+          - x-api-key
+          - x-goog-api-key
+        default: bearer
+        description: Header style used to inject the provider's configured API key.
+  disable_cooldown:
+    type: boolean
+    default: false
+    description: >
+      When true, disables automatic cooldown for this provider. Failed
+      requests won't trigger exponential backoff. Use with caution.
+  stall_cooldown:
+    type: boolean
+    default: false
+    description: >
+      When enabled, stall detection cancellations will trigger cooldown for
+      this provider.
+  allow_100_percent_utilization:
+    type: boolean
+    default: false
+    description: >
+      When enabled, allows quota usage to reach 100% instead of placing the provider
+      on cooldown at 99%. Note: this may result in repeat attempts or failed generations.
+  discount:
+    type: number
+    minimum: 0
+    maximum: 1
+    description: >
+      Cost discount factor applied to usage records for this provider.
+      `0` means no reduction, `1` means 100% discount (free). Used to
+      reflect negotiated discounts in cost calculations.
+  models:
+    oneOf:
+      - type: array
+        items:
+          type: string
+        description: >
+          Simple list of model IDs this provider exposes. Used for model
+          discovery only; does not restrict routing.
+      - type: object
+        additionalProperties:
+          type: object
+          properties:
+            pricing:
+              type: object
+              description: Pricing configuration for this specific model.
+            access_via:
+              type: array
+              items:
+                type: string
+              description: Alternative names this model can be accessed under.
+            type:
+              type: string
+              enum:
+                - text
+                - embeddings
+                - transcriptions
+                - speech
+                - image
+              description: >
+                Model capability type. Text models serve chat/messages/responses
+                inference surfaces.
+            extraBody:
+              type: object
+              additionalProperties: true
+              description: Extra fields merged into the request body for this model.
+            auto_compat:
+              type: boolean
+              default: false
+              description: >
+                Enables compatibility mapping for this model when the provider
+                links to a builtin pi-ai model or declares inline quirks for
+                the target API. Omitted/false leaves provider-level opt-in in
+                effect; it does not disable an enabled provider setting.
+            pi_ai_model_id:
+              type: string
+              description: >
+                Builtin pi-ai model ID used to resolve registry metadata for
+                `auto_compat`. If omitted or not resolvable, auto-compat skips
+                this model without failing the request.
+            adapter:
+              oneOf:
+                - type: string
+                - type: array
+                  items:
+                    oneOf:
+                      - type: string
+                      - type: object
+                        required:
+                          - name
+                        properties:
+                          name:
+                            type: string
+                            description: Adapter name.
+                          options:
+                            type: object
+                            additionalProperties: true
+                            description: Adapter-specific options.
+                          enabled:
+                            type: boolean
+                            default: true
+                            description: >
+                              Set to `false` to remove earlier instances of this
+                              adapter, including provider-level and implicitly
+                              injected ones. A later entry with `enabled: true`
+                              restores it.
+              description: >
+                Adapter name(s) applied to this specific model. Appended after
+                any provider-level adapters. Accepts bare strings or
+                `{ name, options }` objects for parameterized adapters
+                (e.g. `model_override` with rules). See the provider-level
+                `adapter` field for available values.
+        description: >
+          Map of model ID → per-model configuration. Allows per-model pricing
+          overrides and access aliases.
+    description: >
+      Models available on this provider. Either a simple list of IDs or a map
+      of model ID → configuration for per-model pricing/type overrides.
+  headers:
+    type: object
+    additionalProperties:
+      type: string
+    description: >
+      Static headers forwarded on every request to this provider. Useful for
+      custom authentication schemes or provider-specific requirements.
+  maxConcurrency:
+    type: [integer, 'null']
+    minimum: 1
+    description: >
+      Max concurrency across all models. Optional per-provider limit on
+      how many requests can be in-flight simultaneously. Empty/null means
+      no limit.
+  extraBody:
+    type: object
+    additionalProperties: true
+    description: >
+      Extra fields merged into every request body sent to this provider.
+  estimateTokens:
+    type: boolean
+    default: false
+    description: >
+      When true, token counts are estimated locally rather than relying on
+      the provider's response. Useful for providers that omit usage fields.
+  geminiThinkingEnabled:
+    type: boolean
+    description: >
+      When true, enables Gemini-native thinking (extended reasoning) for this
+      provider. Only applicable to Gemini-compatible providers.
+  auto_compat:
+    type: boolean
+    default: false
+    description: >
+      Opts into compatibility mapping from `pi_ai_provider` and/or
+      `pi_ai_quirks` for the target API and exact upstream model ID.
+      Explicit quirks overlay builtin capabilities. Without either source,
+      requests pass through unchanged.
+  pi_ai_provider:
+    type: string
+    description: >
+      Builtin pi-ai provider ID used with `models[*].pi_ai_model_id` or an
+      exact catalog model match. Can be combined with `pi_ai_quirks` overlays.
+  pi_ai_quirks:
+    $ref: ./PiAiQuirks.yaml
+    description: >
+      Inline compatibility traits, keyed by target API type. Model overrides
+      use exact upstream model IDs; `thinkingLevelMap` and `serviceTierMap`
+      replace inherited maps and named `compat` flags merge. These traits
+      overlay a builtin model when available and work independently otherwise.
+      Send null in PATCH to clear previously saved quirks.
+  useClaudeMasking:
+    type: boolean
+    default: false
+    description: >
+      When true, rewrites OpenAI-format requests to look like Claude requests
+      before forwarding. Used for providers that require Anthropic-compatible
+      request shapes.
+  quota_checker:
+    type: object
+    description: >
+      Optional provider-level quota checker configuration. References a
+      quota checker type from `GET /v0/management/quota-checker-types`.
+    additionalProperties: true
+  model_autosync:
+    type: object
+    description: >
+      Optional provider-level model discovery sync. When enabled, ModelMux
+      periodically fetches the provider's known model list and adds any missing
+      models to this provider's `models` configuration without removing or
+      overwriting existing model entries.
+    properties:
+      enabled:
+        type: boolean
+        default: false
+      intervalMinutes:
+        type: integer
+        minimum: 1
+        default: 60
+  adapter:
+    oneOf:
+      - type: string
+      - type: array
+        items:
+          oneOf:
+            - type: string
+            - type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  description: Adapter name.
+                options:
+                  type: object
+                  additionalProperties: true
+                  description: Adapter-specific options.
+                enabled:
+                  type: boolean
+                  default: true
+                  description: >
+                    Set to `false` to remove earlier instances of this adapter,
+                    including implicitly injected defaults. A later entry with
+                    `enabled: true` restores it.
+    description: >
+      Adapter name(s) applied to every model under this provider.
+      Adapters rewrite outbound request payloads (preDispatch) and inbound
+      provider responses (postDispatch) to fix provider-specific field-name
+      incompatibilities. Applied before model-level adapters.
+
+      Adapters can be specified as bare strings (backward compatible) or as
+      objects with `{ name, options }` for adapters that require configuration.
+
+       Available adapters:
+
+      - `reasoning_content` — Renames `reasoning`/`thinking.content` →
+        `reasoning_content` on outbound assistant messages. Fixes Fireworks/
+        DeepSeek providers that reject the `reasoning` field name.
+
+      - `suppress_developer_role` — Rewrites the `developer` role to `system`
+        for providers that do not support the OpenAI `developer` role.
+
+      - `model_override` — Conditionally rewrites the provider model name
+        based on request payload fields. Accepts a `rules` array in options
+        where each rule specifies a `model` to match, a `rewriteTo` model name,
+        and an array of `conditions` (OR semantics) using dotted field paths.
+        Used for providers that expose reasoning variants as separate model
+        names rather than respecting reasoning-related request fields.
+
+      - `reasoning_rewrite` — Declaratively rewrites reasoning/thinking fields
+        in outbound request payloads. Different providers accept reasoning
+        effort via different field names (e.g. `enable_thinking`, `thinking.type`,
+        `chat_template_kwargs.enable_thinking`, `budget_tokens`, `thinking_budget`).
+        This adapter maps from unified fields (e.g. `reasoning.enabled`,
+        `reasoning.effort`) to provider-specific formats. Accepts a `rules`
+        array in options where each rule specifies a `source` dotted path,
+        an optional `when` condition (with `op` and `value`), an array of
+        `rewrites` (each with `target` and `value`), and optional `strip`
+        paths to remove after rewriting. This overlaps with registry-aware
+        `auto_compat`; prefer `auto_compat` for models linked to the pi-ai
+        builtin registry and keep manual rewrites as an explicit escape hatch.
+
+      - `web_search_coercion` — Translates server-side web search tool entries
+        to the format expected by this provider. Clients may send any known web
+        search tool format (`web_search_20250305`, `web_search`,
+        `openrouter:web_search`, or `googleSearch`); the adapter rewrites it
+        to the target provider's canonical shape. Accepts a `target` option
+        (`"anthropic"`, `"openai"`, `"openrouter"`, or `"google"`) and an
+        optional `max_uses` integer (Anthropic target only). Works transparently
+        across all four incoming API surfaces (Chat Completions, Anthropic
+        Messages, OpenAI Responses, and Gemini native).
+        See [`WebSearchCoercionAdapterOptions`](#/components/schemas/WebSearchCoercionAdapterOptions).
+
+      - `normalize_anthropic_tool_ids` — Rewrites `tool_use` / `tool_result`
+        identifiers that violate Anthropic's tool-id charset
+        `^[a-zA-Z0-9_-]+$` (e.g. Moonshot's `functions.WebSearch:3`), which
+        Anthropic rejects with a hard HTTP 400. Injected automatically when the
+        route's outbound wire format is Anthropic Messages AND the provider
+        looks Anthropic (base URL containing `anthropic.com`, Anthropic OAuth,
+        or Claude masking). Override per provider or model with
+        `{ name: 'normalize_anthropic_tool_ids', options: {}, enabled: true }`
+        to force it on for an Anthropic-compatible gateway hosted elsewhere, or
+        `{ name: 'normalize_anthropic_tool_ids', enabled: false }` to opt out.
+
+      Adapters run on the outbound body whether or not the pass-through
+      optimisation is active — a same-format request skips the transformer, but
+      its body is still cloned, given the target model and the provider/model
+      config fields, and run through the adapter chain before dispatch.
+  timeoutMs:
+    type: integer
+    minimum: 1
+    description: >
+      Optional per-provider upstream request timeout in milliseconds.
+      When omitted, ModelMux uses the global timeout from
+      `/v0/management/config/timeout`.
+  stallTtfbMs:
+    type:
+      - integer
+      - 'null'
+    minimum: 5000
+    maximum: 120000
+    description: >
+      Optional per-provider TTFB stall timeout override in milliseconds.
+      Omit to inherit the global value. `null` disables TTFB stall detection
+      for this provider.
+  stallTtfbBytes:
+    type:
+      - integer
+      - 'null'
+    minimum: 50
+    maximum: 10000
+    description: >
+      Optional per-provider byte threshold used to confirm meaningful first
+      output for stall detection. Omit to inherit the global value.
+  stallMinBps:
+    type:
+      - integer
+      - 'null'
+    minimum: 50
+    maximum: 5000
+    description: >
+      Optional per-provider minimum throughput override in bytes per second.
+      Omit to inherit the global value. `null` disables throughput stall
+      detection for this provider.
+  stallWindowMs:
+    type:
+      - integer
+      - 'null'
+    minimum: 3000
+    maximum: 30000
+    description: >
+      Optional per-provider sliding-window width for throughput stall
+      detection, in milliseconds. Omit to inherit the global value.
+  stallGracePeriodMs:
+    type:
+      - integer
+      - 'null'
+    minimum: 0
+    maximum: 120000
+    description: >
+      Optional per-provider grace period before throughput stall detection
+      starts, in milliseconds. Omit to inherit the global value.
