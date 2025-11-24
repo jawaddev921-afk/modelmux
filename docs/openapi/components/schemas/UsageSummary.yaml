@@ -1,0 +1,140 @@
+type: object
+description: >
+  Aggregated usage statistics over time windows.
+properties:
+  range:
+    type: string
+    description: >
+      Requested time range. Both series and stats use this range.
+  series:
+    type: array
+    items:
+      type: object
+      description: Time-bucketed aggregation.
+      properties:
+        bucketStartMs:
+          type: integer
+          description: Start of the time bucket (epoch ms).
+        requests:
+          type: integer
+          description: Number of requests in this bucket.
+        errors:
+          type: integer
+          description: Number of non-success requests in this bucket.
+        inputTokens:
+          type: integer
+          description: Sum of input tokens across all requests.
+        outputTokens:
+          type: integer
+          description: Sum of output tokens across all requests.
+        reasoningTokens:
+          type: integer
+          description: Sum of reasoning tokens across all requests.
+        cachedTokens:
+          type: integer
+          description: Sum of cached tokens across all requests.
+        cacheWriteTokens:
+          type: integer
+          description: Sum of cache-write tokens across all requests.
+        tokens:
+          type: integer
+          description: >
+            Total token count = inputTokens + outputTokens + reasoningTokens +
+            cachedTokens + cacheWriteTokens.
+        totalCost:
+          type: number
+          description: Sum of request costs in the bucket.
+        avgDurationMs:
+          type: number
+          description: Average request duration in milliseconds.
+        avgTtftMs:
+          type: number
+          description: Average time to first token in milliseconds.
+        avgTokensPerSec:
+          type: number
+          description: Average reported tokens per second.
+  stats:
+    type: object
+    description: Aggregation over the requested range.
+    properties:
+      totalRequests:
+        type: integer
+        description: Total requests in the requested range.
+      totalErrors:
+        type: integer
+        description: Total non-success requests in the requested range.
+      totalTokens:
+        type: integer
+        description: >
+          Total tokens (input + output + reasoning + cached + cacheWrite) in
+          the requested range.
+      inputTokens:
+        type: integer
+        description: Total uncached input tokens.
+      outputTokens:
+        type: integer
+        description: Total output tokens.
+      reasoningTokens:
+        type: integer
+        description: Total reasoning tokens.
+      cachedTokens:
+        type: integer
+        description: Total cached input tokens.
+      cacheWriteTokens:
+        type: integer
+        description: Total cache-write tokens.
+      totalCost:
+        type: number
+        description: Total request cost in the requested range.
+      avgDurationMs:
+        type: number
+        description: Average request duration in milliseconds.
+      totalDurationMs:
+        type: integer
+        description: Sum of all request durations in milliseconds.
+      avgTtftMs:
+        type: number
+        description: Average time to first token in milliseconds.
+      avgTokensPerSec:
+        type: number
+        description: Average reported tokens per second.
+      successRate:
+        type: number
+        description: Percentage of requests whose status is success.
+  grouped:
+    type: object
+    description: Optional top-N aggregates for requested dimensions.
+    properties:
+      provider:
+        $ref: ./UsageSummaryBreakdown.yaml
+      modelAlias:
+        $ref: ./UsageSummaryBreakdown.yaml
+      apiKey:
+        $ref: ./UsageSummaryBreakdown.yaml
+      status:
+        $ref: ./UsageSummaryBreakdown.yaml
+  today:
+    type: object
+    description: Aggregation since local midnight (time-of-day based, not UTC).
+    properties:
+      requests:
+        type: integer
+        description: Number of requests since midnight.
+      inputTokens:
+        type: integer
+        description: Input tokens since midnight.
+      outputTokens:
+        type: integer
+        description: Output tokens since midnight.
+      reasoningTokens:
+        type: integer
+        description: Reasoning tokens since midnight.
+      cachedTokens:
+        type: integer
+        description: Cached tokens since midnight.
+      cacheWriteTokens:
+        type: integer
+        description: Cache-write tokens since midnight.
+      totalCost:
+        type: number
+        description: Total cost in dollars since midnight.
