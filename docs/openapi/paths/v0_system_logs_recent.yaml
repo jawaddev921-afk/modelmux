@@ -1,0 +1,64 @@
+get:
+  tags:
+    - Events
+  summary: Get recent in-memory backend logs (admin only)
+  description: |
+    Returns the most recent backend log entries from ModelMux's in-memory log ring buffer.
+
+    ## Retention
+
+    ModelMux keeps a bounded in-memory buffer of recent raw log objects. This endpoint
+    returns the newest entries first and does not persist logs across restarts.
+
+    ## Query parameters
+
+    - `limit` — Maximum number of log entries to return (default 100, max 1000)
+    - `offset` — Number of newest entries to skip (default 0)
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+  parameters:
+    - in: query
+      name: limit
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+      description: Maximum number of recent log entries to return.
+    - in: query
+      name: offset
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+      description: Number of newest entries to skip.
+  responses:
+    '200':
+      description: Recent in-memory log entries, newest first.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+              total:
+                type: integer
+              limit:
+                type: integer
+              offset:
+                type: integer
+            required:
+              - data
+              - total
+              - limit
+              - offset
+    '401':
+      description: Authentication required or invalid credentials.
+  operationId: getV0SystemLogsRecent

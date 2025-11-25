@@ -1,0 +1,175 @@
+get:
+  tags:
+    - Management — Debug
+  summary: Get debug-mode state
+  description: |
+    Returns the current in-memory debug capture configuration.
+
+    Debug target state is intentionally runtime-only. It is not written to the
+    database and is reset when the process restarts, except `DEBUG=true`, which
+    enables global capture at startup.
+
+    Capture is inclusive: a trace is persisted when any enabled dimension
+    matches the request (`enabledGlobal`, key, model alias, provider), or when
+    capture-on-error force-persistence applies. Provider targets do not filter
+    or suppress global, key, or alias capture.
+
+    ## Response shapes
+
+    ### Admin principal
+
+    ```json
+    {
+      "enabled": true,
+      "enabledGlobal": false,
+      "enabledKeys": ["sk-alpha", "sk-beta"],
+      "keys": ["sk-alpha", "sk-beta"],
+      "aliases": ["gpt-4o-mini"],
+      "providers": ["openai", "anthropic"]
+    }
+    ```
+
+    ### Limited principal
+
+    ```json
+    {
+      "enabled": true,
+      "enabledGlobal": false,
+      "enabledForKey": true,
+      "keys": ["sk-alpha"],
+      "aliases": ["gpt-4o-mini"],
+      "providers": ["openai"]
+    }
+    ```
+
+    - **enabled** — For admins, global debug enable. For limited principals, whether their requests are captured by global or per-key debug.
+    - **enabledGlobal** — True if global debug is on.
+    - **enabledKeys** — (admin only) Backward-compatible alias for `keys`.
+    - **keys** — In-memory key-name capture targets.
+    - **aliases** — In-memory canonical model-alias capture targets. Requests made through additional aliases are matched after routing to the canonical alias.
+    - **providers** — In-memory provider-slug capture targets.
+    - **enabledForKey** — (limited only) Whether debug is on for this key.
+  security:
+    - AdminKey: []
+  responses:
+    '200':
+      description: Current state. Shape differs slightly for limited principals.
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+            properties:
+              enabled:
+                type: boolean
+              enabledGlobal:
+                type: boolean
+              enabledForKey:
+                type: boolean
+                description: Only present for limited principals.
+              enabledKeys:
+                type: array
+                items:
+                  type: string
+                description: Only present for admins. Backward-compatible alias for `keys`.
+              keys:
+                type: array
+                items:
+                  type: string
+                description: In-memory key-name capture targets.
+              aliases:
+                type: array
+                items:
+                  type: string
+                description: In-memory canonical model-alias capture targets.
+              providers:
+                type:
+                  - array
+                  - 'null'
+                items:
+                  type: string
+                description: In-memory provider-slug capture targets; `null` means no provider targets are enabled.
+    '401':
+      description: Authentication required or invalid credentials.
+  operationId: getV0ManagementDebug
+patch:
+  tags:
+    - Management — Debug
+  summary: Update debug-mode state (admin only)
+  description: |
+    Update in-memory debug capture settings.
+
+    **Admin only** — limited principals receive 403. Limited users must
+    use `POST /v0/management/self/debug/toggle` to enable debug for their key.
+
+    - **enabled** — Toggle global debug on/off.
+    - **keys** — Replace the in-memory key-name capture target list. `null` or `[]` clears it.
+    - **aliases** — Replace the in-memory canonical model-alias capture target list. `null` or `[]` clears it.
+    - **providers** — Replace the in-memory provider-slug capture target list. `null` or `[]` clears it.
+
+    Capture is inclusive: a trace is persisted when any enabled dimension
+    matches the request. Setting `providers` does not restrict global, key, or
+    alias capture.
+  security:
+    - AdminKey: []
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+            providers:
+              type:
+                - array
+                - 'null'
+              items:
+                type: string
+            keys:
+              type:
+                - array
+                - 'null'
+              items:
+                type: string
+            aliases:
+              type:
+                - array
+                - 'null'
+              items:
+                type: string
+  responses:
+    '200':
+      description: New state.
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+            properties:
+              enabled:
+                type: boolean
+              enabledGlobal:
+                type: boolean
+              enabledKeys:
+                type: array
+                items:
+                  type: string
+              keys:
+                type: array
+                items:
+                  type: string
+              aliases:
+                type: array
+                items:
+                  type: string
+              providers:
+                type:
+                  - array
+                  - 'null'
+                items:
+                  type: string
+    '401':
+      description: Authentication required or invalid credentials.
+  operationId: patchV0ManagementDebug
