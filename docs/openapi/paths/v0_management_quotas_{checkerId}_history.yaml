@@ -1,0 +1,84 @@
+parameters:
+  - in: path
+    name: checkerId
+    required: true
+    schema:
+      type: string
+    description: >
+      Checker ID in format `{provider}:{account}`, e.g. `naga:default`,
+      `moonshot:work`.
+get:
+  tags:
+    - Management — Quotas (Provider)
+  summary: Historical quota samples (admin only)
+  description: |
+    Returns historical quota-snapshot rows for a specific checker, one row per
+    meter per check, sorted by `checkedAt` descending (most recent first).
+
+    ## Query parameters
+
+    - **meterKey** — Filter to a single meter (e.g. `balance`, `five_hour`,
+      `daily`). When omitted, returns rows for all meters the checker reports.
+      Meter keys are provider-specific; discover them from the `meters[].key`
+      field of a snapshot.
+
+    - **since** — Start of the time range. Supports two formats:
+      - **Absolute**: ISO 8601 timestamp, e.g. `2026-01-01T00:00:00Z`
+      - **Relative**: `Nd` format, e.g. `7d` (last 7 days), `30d` (last 30 days)
+
+    ## Response structure
+
+    - `checkerId` — The checker this history is for
+    - `meterKey` — The meter filter used (null if no filter)
+    - `since` — The timestamp of the earliest sample (null if no `since` filter)
+    - `history` — Array of `QuotaSample` snapshot rows
+
+    ## Retention
+
+    Historical samples are retained for 30 days. Trying to query beyond
+    the retention window returns an empty array.
+
+    **Admin only** — limited principals receive 403.
+  operationId: getV0ManagementQuotasBycheckerIdHistory
+  security:
+    - AdminKey: []
+  parameters:
+    - in: query
+      name: meterKey
+      schema:
+        type: string
+      description: >
+        Filter to a single meter (e.g. `balance`, `five_hour`, `daily`).
+        Returns rows for all meters when omitted.
+    - in: query
+      name: since
+      schema:
+        type: string
+      description: >
+        Start of the time range. Supports ISO timestamp (e.g.
+        `2026-01-01T00:00:00Z`) or relative format like `7d`, `30d`.
+  responses:
+    '200':
+      description: History.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              checkerId:
+                type: string
+              meterKey:
+                type:
+                  - string
+                  - 'null'
+              since:
+                type:
+                  - string
+                  - 'null'
+                format: date-time
+              history:
+                type: array
+                items:
+                  $ref: ../components/schemas/QuotaSample.yaml
+    '401':
+      description: Authentication required or invalid credentials.

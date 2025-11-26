@@ -1,0 +1,149 @@
+type: object
+description: >
+  A single persisted quota-snapshot row, as returned in the `history` array of
+  `GET /v0/management/quotas/{checkerId}/history`.
+
+
+  These are raw rows from the `meter_snapshots` table (one row per meter per
+  check), so field names follow the stored column shape (camelCased by the
+  ORM). For the current/latest reading of a meter, see the `Meter` schema —
+  `getLatestQuota` maps these rows into the friendlier `Meter` shape. There is
+  no `windowType` field; a meter is identified by `meterKey`.
+properties:
+  id:
+    type: integer
+    description: Database record ID for this snapshot row.
+  checkerId:
+    type: string
+    description: >
+      Foreign key to the checker this snapshot belongs to. Matches
+      `QuotaCheckerSnapshot.checkerId`.
+  checkerType:
+    type: string
+    description: Checker type identifier at capture time.
+  provider:
+    type: string
+    description: Provider identifier at capture time (e.g. `naga`, `moonshot`).
+  meterKey:
+    type: string
+    description: >
+      Stable identifier for the meter this row captures (e.g. `balance`,
+      `five_hour`, `daily`). Provider-specific; used as the `meterKey` query
+      filter on the history endpoint.
+  kind:
+    type: string
+    enum:
+      - balance
+      - allowance
+    description: Whether this meter tracks a prepaid balance or a time-windowed allowance.
+  unit:
+    type: string
+    description: >
+      Unit of measurement. Common values: `usd`, `requests`, `tokens`,
+      `percentage`; providers may define additional units.
+  label:
+    type: string
+    description: Human-readable label for the meter.
+  group:
+    type:
+      - string
+      - 'null'
+    description: Optional grouping label for multi-tenant or sub-account setups.
+  scope:
+    type:
+      - string
+      - 'null'
+    description: Optional scope qualifier.
+  limit:
+    type:
+      - number
+      - 'null'
+    description: >
+      Maximum allowed value for this meter. For `balance` kind, the prepaid
+      balance in dollars. For `allowance` kind, the request/token limit.
+  used:
+    type:
+      - number
+      - 'null'
+    description: Amount consumed so far. Null when unbounded/unknown.
+  remaining:
+    type:
+      - number
+      - 'null'
+    description: Calculated as `limit - used`. May be negative.
+  utilizationState:
+    type: string
+    enum:
+      - reported
+      - unknown
+      - not_applicable
+    description: >
+      Whether a meaningful utilisation was reported for this row.
+
+      - **reported** — `utilizationPercent` holds a numeric percentage.
+      - **unknown** — The provider did not report enough to compute utilisation.
+      - **not_applicable** — Utilisation is not meaningful for this meter.
+  utilizationPercent:
+    type:
+      - number
+      - 'null'
+    description: >
+      Percentage of quota consumed (`(used / limit) * 100`). Only meaningful
+      when `utilizationState` is `reported`; null otherwise.
+  status:
+    $ref: ./MeterStatus.yaml
+  periodValue:
+    type:
+      - integer
+      - 'null'
+    description: Length of the allowance window. Null for `balance` kind.
+  periodUnit:
+    type:
+      - string
+      - 'null'
+    enum:
+      - minute
+      - hour
+      - day
+      - week
+      - month
+      - null
+    description: Unit for `periodValue`. Null for `balance` kind.
+  periodCycle:
+    type:
+      - string
+      - 'null'
+    enum:
+      - fixed
+      - rolling
+      - null
+    description: How the allowance window resets. Null for `balance` kind.
+  resetsAt:
+    type:
+      - string
+      - 'null'
+    format: date-time
+    description: >
+      ISO-8601 timestamp when the meter window resets. Null for rolling windows
+      or balances without a defined reset time.
+  success:
+    type: boolean
+    description: >
+      Whether the quota query to the provider succeeded. False if the provider
+      API was unreachable or returned an error.
+  errorMessage:
+    type:
+      - string
+      - 'null'
+    description: Error message when `success` is false.
+  checkedAt:
+    type: string
+    format: date-time
+    description: Timestamp when this snapshot was captured.
+  createdAt:
+    type:
+      - string
+      - 'null'
+    format: date-time
+    description: >
+      Timestamp when this record was persisted. Usually matches `checkedAt`.
