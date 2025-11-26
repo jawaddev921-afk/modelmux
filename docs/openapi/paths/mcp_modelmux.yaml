@@ -1,0 +1,140 @@
+post:
+  tags:
+    - MCP Proxy
+  summary: ModelMux Management MCP (JSON-RPC, admin only)
+  description: |
+    The ModelMux Management MCP server is an in-process Model Context Protocol
+    server exposing compact domain tools for managing ModelMux.
+
+    ## Authentication
+
+    Requires the `x-admin-key` header, or the same `ADMIN_KEY` sent as
+    `Authorization: Bearer <ADMIN_KEY>`. Inference API keys are rejected with
+    403. A non-empty `x-admin-key` header takes precedence over the bearer
+    token.
+
+    ## MCP disabled
+
+    When `mcpEnabled` is `false`, requests return HTTP 418
+    (`mcp_disabled`) before authentication. Enable it via
+    `PATCH /v0/management/config/mcp-enabled` or the MCP Servers UI.
+
+    ## Transport
+
+    Uses the Streamable HTTP transport with JSON responses. Each request
+    creates a stateless per-request MCP server instance.
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+    - AdminBearer: []
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          type: object
+          description: JSON-RPC 2.0 request envelope.
+          properties:
+            jsonrpc:
+              type: string
+              const: '2.0'
+            id:
+              oneOf:
+                - type: string
+                - type: number
+            method:
+              type: string
+              description: JSON-RPC method, for example `tools/list` or `tools/call`.
+            params:
+              type: object
+              description: Method-specific parameters.
+        examples:
+          listTools:
+            summary: List available tools
+            value:
+              jsonrpc: '2.0'
+              id: '1'
+              method: tools/list
+          callTool:
+            summary: Call a tool
+            value:
+              jsonrpc: '2.0'
+              id: '2'
+              method: tools/call
+              params:
+                name: modelmux_provider
+                arguments:
+                  operation: list
+  responses:
+    '200':
+      description: JSON-RPC response. Content is JSON or a stream depending on the request.
+      content:
+        application/json:
+          schema:
+            type: object
+            description: JSON-RPC 2.0 response envelope.
+        text/event-stream:
+          schema:
+            type: string
+    '400':
+      description: Malformed JSON-RPC request.
+    '401':
+      description: Authentication required or invalid credentials.
+    '403':
+      description: Limited principals are rejected; this endpoint is admin-only.
+    '418':
+      description: 'ModelMux Management MCP is disabled (`mcpEnabled: false`).'
+  operationId: postMcpModelMux
+get:
+  tags:
+    - MCP Proxy
+  summary: ModelMux Management MCP (SSE stream, admin only)
+  description: |
+    GET endpoint for the ModelMux Management MCP server, supporting
+    server-sent-event MCP transport. It has the same authentication,
+    disabled-check, and tool surface as `POST /mcp/modelmux`.
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+    - AdminBearer: []
+  responses:
+    '200':
+      description: SSE stream or JSON-RPC response.
+      content:
+        text/event-stream:
+          schema:
+            type: string
+        application/json:
+          schema:
+            type: object
+    '401':
+      description: Authentication required or invalid credentials.
+    '403':
+      description: Limited principals are rejected; this endpoint is admin-only.
+    '418':
+      description: 'ModelMux Management MCP is disabled (`mcpEnabled: false`).'
+  operationId: getMcpModelMux
+delete:
+  tags:
+    - MCP Proxy
+  summary: ModelMux Management MCP (session close, admin only)
+  description: |
+    DELETE closes an MCP session. The current stateless per-request transport
+    returns immediately.
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+    - AdminBearer: []
+  responses:
+    '200':
+      description: Session closed or no-op for stateless transport.
+    '401':
+      description: Authentication required or invalid credentials.
+    '403':
+      description: Limited principals are rejected; this endpoint is admin-only.
+    '418':
+      description: 'ModelMux Management MCP is disabled (`mcpEnabled: false`).'
+  operationId: deleteMcpModelMux
