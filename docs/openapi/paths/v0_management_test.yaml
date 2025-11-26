@@ -1,0 +1,122 @@
+post:
+  tags:
+    - Management — Test
+  summary: Synthetic test inference (admin only)
+  description: |
+    Runs a canonical probe request directly against a (provider, model)
+    pair, bypassing alias resolution.
+
+    ## Use case
+
+    Used by the admin UI's "test" button next to each alias target. Allows
+    testing a specific provider/model combination without going through
+    the normal routing pipeline. Internally shares the same probe machinery
+    as background exploration.
+
+    ## Direct bypass
+
+    Unlike normal inference, this endpoint:
+    - Bypasses alias resolution — uses provider/model directly
+    - Uses only the provider's base URL and API key from config
+    - No retries, cooldowns, or quota checks applied
+    - Short timeout (typically 30s)
+
+    ## Usage record attribution
+
+    Test requests appear in usage records with `apiKey = "probe"` and
+    `attribution = "manual"` (background exploration probes use
+    `attribution = "background"`). They are real requests that count
+    against provider quota.
+
+    ## Response
+
+    Returns 200 with `success: false` for runtime errors (failed dispatch,
+    upstream errors). The UI needs to render error messages without
+    treating them as HTTP errors. Validation errors (missing fields,
+    unknown `apiType`, unsupported `transcriptions`) return 400.
+
+    ## Request fields
+
+    - `provider` — Provider slug (e.g. `openai`, `anthropic`)
+    - `model` — Model name (e.g. `gpt-4o`, `claude-3-opus`)
+    - `apiType` — API type (default: `chat`). Options: `chat`, `messages`,
+      `gemini`, `responses`, `embeddings`, `images`, `speech`, `oauth`.
+      The `transcriptions` API requires a file upload and is not supported
+      by this endpoint.
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            provider:
+              type: string
+              description: Provider slug from config (e.g. `openai`, `anthropic`).
+              example: openai
+            model:
+              type: string
+              description: Model name to test.
+              example: gpt-4o
+            apiType:
+              type: string
+              enum:
+                - chat
+                - messages
+                - gemini
+                - responses
+                - embeddings
+                - images
+                - speech
+                - oauth
+              default: chat
+              description: API type to use.
+          required:
+            - provider
+            - model
+  responses:
+    '200':
+      description: Test outcome (success or failure).
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success:
+                type: boolean
+                description: Whether the test request succeeded.
+              durationMs:
+                type: integer
+                description: Time taken for the request.
+              apiType:
+                type: string
+                description: The API type used.
+              response:
+                type: string
+                description: Response body (truncated if large).
+              error:
+                type: string
+                description: Error message if success is false.
+          examples:
+            success:
+              value:
+                success: true
+                durationMs: 1234
+                apiType: chat
+                response: 'Hello! How can I help you?'
+            failure:
+              value:
+                success: false
+                durationMs: 567
+                apiType: chat
+                error: '401 Unauthorized - invalid API key'
+    '400':
+      description: Validation error — missing required fields, unknown
+        `apiType`, or unsupported `transcriptions` apiType.
+    '401':
+      description: Authentication required or invalid credentials.
+  operationId: postV0ManagementTest

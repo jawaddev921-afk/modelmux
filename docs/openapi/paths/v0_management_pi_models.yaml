@@ -1,0 +1,85 @@
+parameters:
+  - in: query
+    name: provider
+    required: true
+    schema:
+      type: string
+    description: >
+      Provider ID from pi-ai library (e.g. `openai`, `anthropic`, `google`).
+      Use `GET /v0/management/pi/providers` to list available providers.
+  - in: query
+    name: q
+    required: false
+    schema:
+      type: string
+    description: >
+      Optional substring filter to search model IDs and names.
+get:
+  tags:
+    - Management — PI (ModelMux Internal)
+  summary: List models for a pi-ai provider (admin only)
+  description: |
+    Returns the list of builtin models available from a specific provider in
+    the `pi-ai` library, optionally filtered by a search query.
+
+    ## Use case
+
+    Discover builtin registry model IDs for `ProviderConfig.models[*].pi_ai_model_id`.
+    These IDs power registry-aware `auto_compat` mapping. Custom pi-ai
+    providers/models are not managed by ModelMux.
+
+    ## Query parameters
+
+    - `provider` (required) — Provider ID from pi-ai library
+    - `q` (optional) — Substring filter on model ID or name
+
+    ## Response format
+
+    Returns an array of model objects with:
+    - `id` — Model identifier
+    - `name` — Human-readable model name
+    - `api` — API type (e.g., `chat`, `embeddings`)
+    - `custom` — Always `false`; only builtin registry models are returned
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+  responses:
+    '200':
+      description: List of models.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                      description: Model identifier
+                    name:
+                      type: string
+                      description: Human-readable model name
+                    api:
+                      type: string
+                      description: API type (e.g., chat, embeddings)
+                    custom:
+                      type: boolean
+                      enum:
+                        - false
+                      description: Always false; only builtin pi-ai registry models are returned.
+    '400':
+      description: Missing or invalid provider parameter.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+    '401':
+      description: Authentication required or invalid credentials.
+  operationId: getV0ManagementPiModels

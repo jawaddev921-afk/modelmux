@@ -1,0 +1,40 @@
+get:
+  tags:
+    - Management — PI (ModelMux Internal)
+  summary: List builtin pi-ai provider IDs (admin only)
+  description: |
+    Returns the list of builtin provider IDs known to the `pi-ai` library.
+    These are the providers available for registry model discovery via the
+    `/v0/management/pi/models` endpoint.
+
+    ## Use case
+
+    Use this endpoint to discover provider IDs for `ProviderConfig.pi_ai_provider`,
+    then query `/v0/management/pi/models` with a specific provider to get builtin
+    model IDs for `models[*].pi_ai_model_id`.
+
+    Custom pi-ai providers/models are not managed by ModelMux.
+
+    ## Response format
+
+    Returns an array of provider ID strings (e.g., `["openai", "anthropic", "google"]`).
+
+    **Admin only** — limited principals receive 403.
+  security:
+    - AdminKey: []
+  responses:
+    '200':
+      description: List of provider IDs.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data:
+                type: array
+                items:
+                  type: string
+                description: Provider ID strings
+    '401':
+      description: Authentication required or invalid credentials.
+  operationId: getV0ManagementPiProviders
