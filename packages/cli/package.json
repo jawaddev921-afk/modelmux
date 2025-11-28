@@ -1,0 +1,25 @@
+{
+  "name": "@jawaddev921-afk/modelmux-cli",
+  "version": "0.0.1",
+  "description": "Dynamic command line client for ModelMux management APIs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jawaddev921-afk/modelmux"
+  },
+  "bin": {
+    "modelmuxcli": "src/index.ts"
+  },
+  "files": [
+    "README.md",
+    "src/cli.ts",
+    "src/index.ts"
+  ],
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "typecheck": "bun check"
+  },
+  "engines": {
+    "bun": ">=1.4.4"
+  }
+}
